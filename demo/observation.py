@@ -1,4 +1,5 @@
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional, Union
 import numpy as np
 from config import *
 from core import EV, MCS, FCS, euclidean_distance
@@ -9,24 +10,17 @@ from core import EV, MCS, FCS, euclidean_distance
 # ============================================================
 class ObservationBuilder:
     """观测构建器 (Target-based, GNN 占位)
-
     为 MCS / IEV 智能体构建结构化观测 dict，
     结构兼容 env/world.py 的 get_agent_obs()。
     """
 
-    # ──────────────────────────────────────────
-    # MCS 观测
-    # ──────────────────────────────────────────
     def obs_mcs(self, mcs: MCS):
         """
         针对 MCS-Low-Policy Actor
-        为 MCS智能体 构造观测特征矩阵，包括附近K_max个候选对象的特征 以及 自身的特征
-        同时返回掩码向量
+        为 MCS智能体 构造观测特征矩阵obs(包括附近K_max个候选对象的特征 以及 自身的特征)
+        return obs, mask_arr
         """
-        features = []  # 特征矩阵   k_max * d_in_target(5)
-        mask = []  # mask向量  k_max
         candidates: List[EV] = [ev for ev in mcs.near_quasi]
-
         # 按照规则排序
         if TOP_K_MCS_CANDIDATES and len(candidates) > 1:
             candidates.sort(key=lambda ev: euclidean_distance(
@@ -36,17 +30,21 @@ class ObservationBuilder:
             candidates = candidates[:TOP_K_MCS_CANDIDATES]
 
         # 构建观测特征矩阵：
+        features = []  # 特征矩阵   k_max * d_in_target(5)
+        mask = []  # mask向量  k_max
         for quasi in candidates:
-            # mcs-quasi 交互信息
+            # 1.电量缺口
+            # 2.mcs-quasi二者间距离
             dist_km = euclidean_distance(
                 mcs.pos[0], mcs.pos[1],
                 quasi.pos[0], quasi.pos[1]) / 1000.0
-            # 周围环境感知
+            dist_km = dist_km / COMM_RANGE
+            # 3.附近 竞争 与
             attraction: float = 0.0
             competition_mcs: float = 0.0
             competition_fcs: float = 0.0
             attractors: List[EV] = quasi.near_quasi + quasi.near_iev
-            # 附近的IEV and quasi
+            # 吸引: 目的地周围的 IEV and quasi
             for other in attractors:
                 d_km = euclidean_distance(
                     quasi.pos[0], quasi.pos[1],
@@ -55,44 +53,49 @@ class ObservationBuilder:
                     attraction += 1.5 * other.need_power / (d_km + 1)
                 else:
                     attraction += other.need_power / (d_km + 1)
-            # 附近的idle MCS
+            # 竞争: 目的地周围的 其他的 idle MCS
             for cpt in quasi.near_idle_mcs:
+                if cpt.id == mcs.id:
+                    continue
                 d_km = euclidean_distance(
                     quasi.pos[0], quasi.pos[1],
                     cpt.pos[0], cpt.pos[1]) / 1000.0
-                competition_mcs += cpt.remain / (d_km + 1)
+                competition_mcs += min(cpt.remain, MAX_CHARGE_PER_SESSION_KWH) / MAX_CHARGE_PER_SESSION_KWH / (d_km + 1)
             # 附近的avail FCS
             for cpt in quasi.near_available_fcs:
                 d_km = euclidean_distance(
                     quasi.pos[0], quasi.pos[1],
                     cpt.pos[0], cpt.pos[1]) / 1000.0
-                competition_fcs += cpt.available_slots / (d_km + 1)
+                competition_fcs += cpt.available_slots * 1.0 / (d_km + 1)
             features.append([quasi.need_power, dist_km, attraction, competition_mcs, competition_fcs])
             mask.append(False)
 
         # MCS智能体自身的特征向量（d_self(3)）
         need: float = 0.0
         support: float = 0.0
-        nearest_dist = 99
+        nearest_dist = COMM_RANGE
         for fcs in mcs.near_available_fcs:
             dist_km = euclidean_distance(
                 mcs.pos[0], mcs.pos[1],
-                fcs.pos[0], mcs.pos[1]
+                fcs.pos[0], fcs.pos[1]
             ) / 1000.0
             if dist_km < nearest_dist:
                 nearest_dist = dist_km
-            support += MAX_CHARGE_TIME_MIN * fcs.available_slots
+            support += MAX_CHARGE_PER_SESSION_KWH * fcs.available_slots
         for m in mcs.near_idle_mcs:
-            support += m.remain
+            support += min(m.remain, MAX_CHARGE_PER_SESSION_KWH)
         for ev in mcs.near_iev:
             need += ev.need_power
         for ev in mcs.near_quasi:
             weight = min(EV_LOW_POWER_THRESHOLD / ev.remain, 1)
-            need += ev.need_power * weight
-        # 1.紧急程度
-        warn_degree = mcs.remain / (1 + (POWER_UNIT * max(0.01, nearest_dist)))
-        # 2.附近电量供求比例
-        ns_rate = need / (1 + support)
+            need += weight * ev.need_power
+        # 1.剩余电量占比
+        remain_ratio = mcs.remain / MCS_BATTERY_CAPACITY
+        # 2.安全程度
+        nearest_dist = nearest_dist / COMM_RANGE
+        safe_degree = remain_ratio / (1e-4 + nearest_dist)
+        # 3.附近电量供求比例
+        ns_rate = need / (1e-4 + need + support)
 
         # 候选对象数量不足k_max时，用0补齐，mask矩阵
         if len(candidates) < TOP_K_MCS_CANDIDATES:
@@ -103,27 +106,84 @@ class ObservationBuilder:
                 mask.append(True)
 
         obs_tgt = np.array(features)
-        obs_self = np.array([mcs.remain, warn_degree, ns_rate])
+        obs_self = np.array([remain_ratio, safe_degree, ns_rate])
+        mask_arr = np.array(mask, dtype=bool)
         obs = {"obs_self": obs_self,  # 观测特征向量 d_in_self
                "obs_tgt": obs_tgt,  # 观测特征向量 k_max * d_in_target
+               "mask": mask_arr,  # 掩码向量 k_max
                "done": False}
-        mask_arr = np.array(mask, dtype=bool)
 
-        return obs, mask_arr
+        return obs
 
-    # ──────────────────────────────────────────
-    # IEV 观测
-    # ──────────────────────────────────────────
-
-    def build_iev_obs(self, ev: EV) -> Dict[str, Any]:
-        """为 IEV 构建观测。
-        先只做MCS的调度，后续扩展补充
+    def obs_iev(self, iev: EV):
         """
-        pass
+        为 IEV 构建观测。
+        """
+        candidates: List[Optional[Union[FCS, MCS]]] = (iev.near_task_mcs or []) + (iev.near_busy_fcs or [])
+        # 按照规则排序
+        if TOP_K_IEV_CANDIDATES and len(candidates) > 1:
+            candidates.sort(key=lambda target: euclidean_distance(
+                iev.pos[0], iev.pos[1], target.pos[0], target.pos[1]))
+        # 取Top-K
+        if TOP_K_IEV_CANDIDATES and len(candidates) > TOP_K_IEV_CANDIDATES:
+            candidates = candidates[:TOP_K_IEV_CANDIDATES]
 
-    # ──────────────────────────────────────────
-    # 全局状态
-    # ──────────────────────────────────────────
+        # 构建观测特征矩阵obs_tgt:
+        features = []  # 特征矩阵   k_max * d_in_target(4)
+        mask = []  # mask向量  k_max
+        for target in candidates:
+            # 1.剩余充电时间
+            if isinstance(target, MCS):
+                remain_time_min = target.charge_time_remain_min
+            else:
+                non_zero_remain = [x for x in target.slot_charge_remain_min if x != 0]
+                remain_time_min = min(non_zero_remain) if non_zero_remain else 99
+            # 2.二者距离
+            dist_km = euclidean_distance(
+                iev.pos[0], iev.pos[1],
+                target.pos[0], target.pos[1]) / 1000.0
+            # 3.附近 竞争 与 吸引
+            competition: float = 0.0
+            attraction: float = 0.0
+            attractors: List[Optional[Union[MCS, FCS]]] = target.near_idle_mcs + target.near_available_fcs
+            # 吸引: 目的地周围的 idle MCS 和 avail FCS
+            for other in attractors:
+                d_km = euclidean_distance(
+                    target.pos[0], target.pos[1],
+                    other.pos[0], other.pos[1]) / 1000.0
+                if isinstance(other, MCS):  # idle MCS更优
+                    attraction += 1.2 * min(other.remain, MAX_CHARGE_PER_SESSION_KWH) / (d_km + 1)
+                else:
+                    attraction += MAX_CHARGE_PER_SESSION_KWH * other.available_slots / (d_km + 1)
+            # 竞争: 目的地周围的 iev
+            for cpt in target.near_iev:
+                d_km = euclidean_distance(
+                    target.pos[0], target.pos[1],
+                    cpt.pos[0], cpt.pos[1]) / 1000.0
+                competition += cpt.need_power / (d_km + 1)
+            features.append([remain_time_min, dist_km, attraction, competition])
+            mask.append(False)
+        obs_tgt = np.array(features)
+
+        # IEV智能体自身的特征向量obs_self:
+        obs_self = np.array([iev.remain, iev.total_wait_time_min])
+
+        # 候选对象数量不足k_max时，用0补齐，mask矩阵
+        if len(candidates) < TOP_K_MCS_CANDIDATES:
+            pad_num = TOP_K_MCS_CANDIDATES - len(candidates)
+            for _ in range(pad_num):
+                zero_feature = [0.0] * MCS_FEAT_DIM_tgt
+                features.append(zero_feature)
+                mask.append(True)
+
+        mask_arr = np.array(mask, dtype=bool)
+        obs = {"obs_self": obs_self,  # 观测特征向量 d_in_self
+               "obs_tgt": obs_tgt,  # 观测特征向量 k_max * d_in_target
+               "mask": mask_arr,  # 掩码向量 k_max
+               "done": False}
+
+        return obs
+
     def build_global_state(self, EVs: List[EV], MCSs: List[MCS], FCSs: List[FCS]) -> np.ndarray:
         """
         构造 Critic 使用的 6 维全局状态摘要。
@@ -174,8 +234,8 @@ class ObservationBuilder:
                 dist = distance_km(mcs, fcs)
                 if dist <= region_km:
                     available_energy = (
-                        float(fcs.available_slots)
-                        * float(MAX_CHARGE_PER_SESSION_KWH)
+                            float(fcs.available_slots)
+                            * float(MAX_CHARGE_PER_SESSION_KWH)
                     )
                     competition += available_energy / (dist + 1)
             mcs_competition_values.append(competition)
@@ -228,4 +288,3 @@ class ObservationBuilder:
             ],
             dtype=np.float32,
         )
-

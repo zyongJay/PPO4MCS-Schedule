@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push *)",
+      "Bash(PYTHONIOENCODING=utf-8 python *)",
+      "Bash(python radar_plot.py)",
+      "Bash(pip show *)",
+      "Bash(pip list *)",
+      "Bash(python *)",
+      "Bash(conda env *)",
+      "Bash(where conda *)",
+      "Bash(conda info *)",
+      "Bash(pip install *)"
+    ]
+  }
+}

@@ -133,8 +133,8 @@ def check_hard_constraints(ev: EV, r_type: str, r_obj):
       2. MCS 剩余电量 >= EV.need_power + detour_power + MCS移动耗电
       3. EV 剩余电量足够移动到充电点 (中点)
     """
-    dist = euclidean_distance(ev.pos[0], ev.pos[1], r_obj.pos[0], r_obj.pos[1])
-    if dist > COMM_RANGE:
+    dist_m = euclidean_distance(ev.pos[0], ev.pos[1], r_obj.pos[0], r_obj.pos[1])
+    if dist_m / 1000.0 > COMM_RANGE:
         return False, np.inf
 
     charge_pos = [(ev.pos[0] + r_obj.pos[0]) / 2.0, (ev.pos[1] + r_obj.pos[1]) / 2.0] if r_type == "MCS" else list(
@@ -146,12 +146,12 @@ def check_hard_constraints(ev: EV, r_type: str, r_obj):
                       ) / 1000.0
     if r_type == 'MCS':
         # EV 到中点距离 = dist / 2
-        energy_to_charge_point = (dist / 2.0 / 1000.0) * POWER_UNIT
+        energy_to_charge_point = (dist_m / 2.0 / 1000.0) * POWER_UNIT
         if r_obj.remain < ev.need_power + detour_dist_km * POWER_UNIT + energy_to_charge_point:
             return False, np.inf
     else:
         # EV 到 FCS 距离 = dist
-        energy_to_charge_point = (dist / 1000.0) * POWER_UNIT
+        energy_to_charge_point = (dist_m / 1000.0) * POWER_UNIT
 
     # EV 剩余电量不足以移动到充电点
     if ev.remain < energy_to_charge_point:
@@ -200,7 +200,8 @@ class ImmediateMatcher:
                 resources.append(('MCS', mcs))
 
         for fcs in all_fcss:
-            if fcs.has_available_slot():
+            # Each free slot must occupy one Hungarian resource column.
+            for _ in range(fcs.available_slots):
                 resources.append(('FCS', fcs))
 
         if not resources:
@@ -346,7 +347,8 @@ class RechargeMatcher:
         # ── Step 1: 构造 FCS 资源集合 ──
         resources = []
         for fcs in all_fcss:
-            if fcs.has_available_slot():
+            # Duplicate the FCS column once per currently available slot.
+            for _ in range(fcs.available_slots):
                 resources.append(fcs)
 
         if not resources:
@@ -359,7 +361,7 @@ class RechargeMatcher:
             mcs_charge_info.append(needed)
 
         # ── Step 3: 构建距离代价矩阵 ──
-        cost = self.build_recharge_cost_matrix(recharge_mcss, resources)
+        cost, validity = self.build_recharge_cost_matrix(recharge_mcss, resources)
 
         # ── Step 4: Hungarian 全局匹配 ──
         assignments = global_match(cost)
@@ -368,11 +370,15 @@ class RechargeMatcher:
         results = []
         matched_mcs = set()
         for mcs_idx, res_idx in assignments:
+            # Recheck feasibility before binding; Hungarian may return an INF assignment.
+            if not validity[mcs_idx, res_idx]:
+                continue
+
             mcs = recharge_mcss[mcs_idx]
             fcs = resources[res_idx]
             charge_power = mcs_charge_info[mcs_idx]
             charge_power += euclidean_distance(mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]) / 1000.0 * POWER_UNIT
-            charge_power = min(charge_power, MAX_CHARGE_PER_SESSION_KWH)
+            charge_power = min(charge_power, MAX_RECHARGE_PER_SESSION_KWH)
             charge_time_min = charge_power / CHARGE_SPEED_PER_MIN
 
             mcs.set_target(
@@ -408,17 +414,28 @@ class RechargeMatcher:
 
         return results
 
-    def build_recharge_cost_matrix(self, mcs_list: List[MCS], resources: List[FCS]) -> np.ndarray:
+    def build_recharge_cost_matrix(self, mcs_list: List[MCS], resources: List[FCS]) -> Tuple[np.ndarray, np.ndarray]:
         """构建距离代价矩阵。"""
         n_mcs = len(mcs_list)
         n_res = len(resources)
-        cost = np.zeros((n_mcs, n_res), dtype=np.float64)
+        cost = np.full((n_mcs, n_res), 1e9, dtype=np.float64)
+        validity = np.zeros((n_mcs, n_res), dtype=bool)
 
         for i, mcs in enumerate(mcs_list):
             for j, fcs in enumerate(resources):
                 dist_km = euclidean_distance(mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]) / 1000.0
+
+                # 硬性约束
+                if dist_km > COMM_RANGE:
+                    continue
+                energy_to_fcs = dist_km * POWER_UNIT
+                if mcs.remain < energy_to_fcs:
+                    continue
+
+                validity[i, j] = True
+
                 dist_norm = dist_km / max(COMM_RANGE, 1.0)
                 reliability = 1.0 - fcs.available_slots * 1.0 / max(1, fcs.capacity)
                 cost[i, j] = self.w_dist * dist_norm + self.w_reliability * reliability
 
-        return cost
+        return cost, validity

@@ -22,7 +22,7 @@ from typing import Dict, List
 import numpy as np
 
 from config import *
-from core import EV, MCS, MCSState, euclidean_distance
+from core import EV, MCS, euclidean_distance
 
 
 class RewardBuilder:
@@ -48,7 +48,7 @@ class RewardBuilder:
     # MCS 奖励
     # ============================================================
 
-    def compute_mcs_reward(self, mcs: MCS, info: Dict) -> float:
+    def compute_mcs_reward(self, mcs: MCS, info: Dict, MCSState=None) -> float:
         """计算单个 MCS 智能体的步级奖励。
 
         参照 env/world.py MCS 局部奖励:
@@ -122,13 +122,13 @@ class RewardBuilder:
             r_local -= 0.5 * nearby_fail
 
         # ── 6. Credit Assignment: 成功接单 ──
-        if not mcs.is_idle and mcs.current_target is not None and mcs.state == MCSState.TASK:
+        if not mcs.is_idle and mcs.current_target is not None and mcs.is_task:
             charge_ratio = min(mcs.charge_power_kwh, max_charge) / max(1.0, max_charge)
             r_local += 1.0 * charge_ratio
 
         # ── 7. 全局奖励 ──
         r_global = 0.0
-        if not mcs.is_idle and mcs.state == MCSState.TASK:
+        if not mcs.is_idle and mcs.is_task:
             total = self.step_success_count + self.step_fail_count + 1
             r_global += self.step_success_count / total
             r_global += min(mcs.charge_power_kwh, max_charge) / max(1.0, max_charge)

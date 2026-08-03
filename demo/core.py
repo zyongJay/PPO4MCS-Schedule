@@ -1,5 +1,6 @@
 import enum
 import math
+import time
 from typing import List, Tuple, Optional, Union
 from config import *
 
@@ -11,8 +12,28 @@ class SlotState(enum.Enum):
 
 
 def euclidean_distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    # 计算两点欧式距离，单位：m
-    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+    # # 计算两点欧式距离，单位：m
+    # return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+    # 或者切换为地球球面距离，单位：m
+    # x1: lon1, y1: lat1, x2: lon2, y2: lat2
+    lon1 = float(x1)
+    lon2 = float(x2)
+    lat1 = float(y1)
+    lat2 = float(y2)
+    dLat = (lat2 - lat1) * math.pi / 180.0
+    dLon = (lon2 - lon1) * math.pi / 180.0
+
+    # convert to radians
+    lat1 = lat1 * math.pi / 180.0
+    lat2 = lat2 * math.pi / 180.0
+
+    # apply formulae
+    a = (pow(math.sin(dLat / 2), 2) +
+         pow(math.sin(dLon / 2), 2) *
+         math.cos(lat1) * math.cos(lat2))
+    rad = 6371
+    c = 2 * math.asin(math.sqrt(a))
+    return rad * c * 1000.0
 
 
 def is_in_area(x: float, y: float) -> bool:
@@ -64,12 +85,12 @@ class EV:
         self.pos = list(pos)
         self.last_pos = list(pos)
         self.remain = remain_kwh
-        self.total_distance = total_distance_km     # 轨迹总长度
+        self.total_distance = total_distance_km  # 轨迹总长度
         self.detour_dist_km = 0.0
 
         # ── 轨迹 ──
         self.destination = []  # 终点坐标
-        self.track = None
+        self.track = []
         self.track_index = 0
         self.arrived = False  # 是否已到达轨迹终点
 
@@ -78,9 +99,9 @@ class EV:
         self.need_charge = False
         self.need_power = max(total_distance_km * POWER_UNIT - remain_kwh, 0.0)
         self.is_normal = False
-        self.is_charged = False   # 是否已被匹配充电
+        self.is_charged = False  # 是否已被匹配充电
         self.fail_charge = False  # 充电失败
-        self.is_arrive = False    # 是否达到充电位置
+        self.is_arrive = False  # 是否达到充电位置
         self.set_charge()
 
         # ── 统计 ──
@@ -131,7 +152,7 @@ class EV:
             if self.need_charge:  # 如果电车原来就在需要充电的状态
                 self.wait_time_steps += 1
                 if self.wait_time_steps > MAX_WAIT_TIME_STEPS:
-                    self.fail_charge = True         # 超时失败
+                    self.fail_charge = True  # 超时失败
                     self.need_charge = False
 
             else:  # 刚变成IEV状态
@@ -193,24 +214,27 @@ class EV:
         self.waiting_target_id = -1
         self.waiting_target_type = ""
         self.waiting_target_pos = None
+
+        self.charge_power_kwh = 0.0  # 计划充电量
+        self.charge_time_remain_min = 0.0  # 剩余充电时间
         # 下一个step从充电位置移动到下一个轨迹点
 
-    def reset(self, pos: List[float], remain_kwh: float, total_distance_km: float):
+    def reset(self, pos: List[float], remain_kwh: float):
         self.pos = list(pos)
         self.last_pos = list(pos)
         self.remain = remain_kwh
-        self.total_distance = total_distance_km
+        # self.total_distance = total_distance_km
 
         # ── 轨迹 ──
-        self.destination = []  # 终点坐标
-        self.track = None
+        # self.destination = []  # 终点坐标
+        # self.track = []
         self.track_index = 0
         self.arrived = False  # 是否已到达轨迹终点
 
         # ── 状态 ──
         self.state = None
         self.need_charge = False
-        self.need_power = max(total_distance_km * POWER_UNIT - remain_kwh, 0.0)
+        self.need_power = max(self.total_distance * POWER_UNIT - remain_kwh, 0.0)
         self.is_normal = False
         self.is_charged = False  # 是否已被匹配充电
         self.fail_charge = False  # 充电失败
@@ -343,7 +367,7 @@ class MCS:
             self.total_cost += (energy_consumed + charge_power) * RC_PRICE
 
         elif target_type == "FCS":
-            self.is_idle = False        # 补电期间不参与充电匹配
+            self.is_idle = False  # 补电期间不参与充电匹配
             self.is_recharging = True
             self.is_arrive = False
 
@@ -362,18 +386,21 @@ class MCS:
             rest_time = min(rest_time_mcs, rest_time_iev)  # 抵达充电位置后剩余充电时间（min）
             # 本step移动后，若双方均到达且仍有时间，则剩余时间用于充电
             if self.is_arrive and self.current_target.is_arrive and rest_time > 0:
-                # 充电指标更新
-                self.charge_time_remain_min -= rest_time
-                self.charge_power_kwh -= rest_time * CHARGE_SPEED_PER_MIN
-                self.current_target.charge_time_remain_min -= rest_time
-                self.current_target.charge_power_kwh -= rest_time * CHARGE_SPEED_PER_MIN
-                # 实际电量转移
-                self.remain -= rest_time * CHARGE_SPEED_PER_MIN
-                self.current_target.remain += rest_time * CHARGE_SPEED_PER_MIN
-                if self.charge_time_remain_min <= 0 or self.charge_power_kwh <= 0:
+                if self.charge_time_remain_min > rest_time:
+                    # 充电指标更新
+                    self.charge_time_remain_min -= rest_time
+                    self.charge_power_kwh -= rest_time * CHARGE_SPEED_PER_MIN
+                    self.current_target.charge_time_remain_min -= rest_time
+                    self.current_target.charge_power_kwh -= rest_time * CHARGE_SPEED_PER_MIN
+                    # 实际电量转移
+                    self.remain -= rest_time * CHARGE_SPEED_PER_MIN
+                    self.current_target.remain += rest_time * CHARGE_SPEED_PER_MIN
+                else:
+                    # 实际电量转移
+                    self.remain -= self.charge_power_kwh
+                    self.current_target.remain += self.charge_power_kwh
                     self.current_target.finish_charging()
                     self.finish_charging()
-
         else:  # 二者均已抵达充电位置
             # 任务状态变化
             charge_min = min(STEP_DURATION_MIN, self.charge_time_remain_min)
@@ -458,7 +485,7 @@ class MCS:
 
 
 class FCS:
-    def __init__(self, fcs_id: int, pos: List[float], num_slots: int):
+    def __init__(self, fcs_id: int, pos: List[float], num_slots: int = FCS_SLOTS_PER_STATION):
         self.id = fcs_id
         self.pos = list(pos)
         self.num_slots = num_slots
@@ -476,6 +503,14 @@ class FCS:
         self.total_charged_kwh = 0.0  # 为IEV充电 和 为MCS补电的总电量
         self.total_profit = 0.0  # 为IEV充电 和 为MCS补电 的净利润
         self.total_cost = 0.0  # 充电成本
+
+        # 邻居信息
+        self.near_quasi = []
+        self.near_iev = []
+        self.near_idle_mcs = []
+        self.near_task_mcs = []
+        self.near_available_fcs = []
+        self.near_busy_fcs = []
 
     @property
     def capacity(self) -> int:
@@ -554,13 +589,16 @@ class FCS:
             if not self.slot_target[idx].is_arrive:
                 rest_time = move_toward_target(self.slot_target[idx], self.pos)
                 if self.slot_target[idx].is_arrive and rest_time > 0:
-                    self.slot_charge_remain_min[idx] -= rest_time
-                    self.slot_charge_remain_kwh[idx] -= rest_time * CHARGE_SPEED_PER_MIN
-                    self.slot_target[idx].charge_time_remain_min -= rest_time
-                    self.slot_target[idx].charge_power_kwh -= rest_time * CHARGE_SPEED_PER_MIN
-                    # 实际电量转移
-                    self.slot_target[idx].remain += rest_time * CHARGE_SPEED_PER_MIN
-                    if self.slot_charge_remain_min[idx] <= 0 or self.slot_charge_remain_kwh[idx] <= 0:
+                    if self.slot_charge_remain_min[idx] > rest_time:
+                        # 充电信息更新
+                        self.slot_charge_remain_min[idx] -= rest_time
+                        self.slot_charge_remain_kwh[idx] -= rest_time * CHARGE_SPEED_PER_MIN
+                        self.slot_target[idx].charge_time_remain_min -= rest_time
+                        self.slot_target[idx].charge_power_kwh -= rest_time * CHARGE_SPEED_PER_MIN
+                        # 实际电量转移
+                        self.slot_target[idx].remain += rest_time * CHARGE_SPEED_PER_MIN
+                    else:
+                        self.slot_target[idx].remain += self.slot_charge_remain_kwh[idx]
                         self.slot_target[idx].finish_charging()
                         self.release_slot(idx)
             else:
@@ -589,3 +627,10 @@ class FCS:
         self.total_idle_time = 0.0
         self.total_charged_kwh = 0.0
         self.total_profit = 0.0
+
+        self.near_quasi = []
+        self.near_iev = []
+        self.near_idle_mcs = []
+        self.near_task_mcs = []
+        self.near_available_fcs = []
+        self.near_busy_fcs = []

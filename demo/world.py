@@ -12,13 +12,14 @@ demo/world.py — 仿真世界实现 (Target-based Replanning 架构)
 """
 
 import random
+import time
 from typing import Dict, List
 
 import numpy as np
+import pandas as pd
 
 from config import *
-from core import (
-    EV, MCS, FCS, euclidean_distance, )
+from core import EV, MCS, FCS, euclidean_distance
 from matching import ImmediateMatcher
 from observation import ObservationBuilder
 from reward import RewardBuilder
@@ -29,7 +30,7 @@ from reward import RewardBuilder
 # ============================================================
 
 class World:
-    """仿真世界 — EV-FCS-MCS 协同充电调度 (Target-based Replanning)"""
+    """仿真世界 — EV-FCS-MCS 协同充电调度"""
 
     def __init__(self, seed: int = 42, verbose: bool = True):
         self.seed_val = seed
@@ -48,6 +49,11 @@ class World:
         self.reward_builder = RewardBuilder()
         self.immediate_matcher = ImmediateMatcher()  # IEV 与 idle MCS / Avail FCS 的即时匹配
 
+        self.mcs_positions = [np.random.uniform(AREA_LON_MIN, AREA_LON_MAX, NUM_MCS),
+                              np.random.uniform(AREA_LAT_MIN, AREA_LAT_MAX, NUM_MCS)]
+        self.fcs_positions = [np.random.uniform(AREA_LON_MIN, AREA_LON_MAX, NUM_FCS),
+                              np.random.uniform(AREA_LAT_MIN, AREA_LAT_MAX, NUM_FCS)]
+
         self.current_step = 0
         self.init_world()
 
@@ -61,33 +67,60 @@ class World:
         self.MCSs.clear()
         self.FCSs.clear()
 
-        # FCS
-        fcs_positions = [[100.0, 100.0], [400.0, 400.0]]
-        for i in range(NUM_FCS):
-            pos = fcs_positions[i % len(fcs_positions)]
-            n_slots = FCS_SLOTS_PER_STATION[i] if i < len(FCS_SLOTS_PER_STATION) else 2
-            self.FCSs.append(FCS(fcs_id=i, pos=list(pos), num_slots=n_slots))
-
         # MCS
-        mcs_positions = [[150.0, 300.0], [300.0, 200.0], [350.0, 100.0]]
         for i in range(NUM_MCS):
-            pos = mcs_positions[i % len(mcs_positions)]
-            self.MCSs.append(MCS(mcs_id=i, pos=list(pos)))
+            pos = [float(self.mcs_positions[0][i]), float(self.mcs_positions[1][i])]
+            mcs = MCS(mcs_id=i + 1, pos=pos, remain_kwh=MCS_BATTERY_CAPACITY)
+            self.MCSs.append(mcs)
+
+        # FCS
+        for i in range(NUM_FCS):
+            pos = [float(self.fcs_positions[0][i]), float(self.fcs_positions[1][i])]
+            fcs = FCS(fcs_id=i + 1, pos=pos, num_slots=FCS_SLOTS_PER_STATION)
+            self.FCSs.append(fcs)
 
         # EV
-        ev_positions = [[50.0, 200.0], [200.0, 100.0], [400.0, 50.0],
-                        [300.0, 400.0], [100.0, 450.0]]
-        ev_remains = [25.0, 35.0, 15.0, 55.0, 8.0]
-        for i in range(NUM_EV):
-            pos = ev_positions[i % len(ev_positions)]
-            remain = ev_remains[i % len(ev_remains)]
-            ev = EV(ev_id=i, pos=list(pos), remain_kwh=remain, total_distance_km=10.0)
-            dest_x = (pos[0] + 200.0) % AREA_WIDTH
-            dest_y = (pos[1] + 150.0) % AREA_HEIGHT
-            ev.destination = [dest_x, dest_y]
-            ev.track = [list(pos), [dest_x, dest_y]]
+        ev_track_data = pd.read_csv(TRACK_DATA_PATH)
+        shuffled_indices = ev_track_data.index.tolist()
+        random.shuffle(shuffled_indices)
+        counter = 1
+        for index in shuffled_indices:
+            if counter > NUM_EV:
+                break
+            row = ev_track_data.loc[index]
+            remain = np.random.normal(loc=EV_POWER_MEAN, scale=EV_POWER_STD)
+            if remain - row['distance'] * POWER_UNIT >= 0:
+                continue
+            ev = EV(counter, [float(row['lng']), float(row['lat'])], remain, row['distance'])
+            tracks = row['track'].split(',')
+            # 插值修复轨迹
+            for i in range(len(tracks)):
+                if i < len(tracks) - 1:
+                    cur_track, nxt_track = tracks[i], tracks[i+1]
+                    x1, y1 = cur_track.split(' ')
+                    x2, y2 = nxt_track.split(' ')
+                    x1, y1 = float(x1), float(y1)
+                    x2, y2 = float(x2), float(y2)
+                    ev.track.append([float(x1), float(y1)])  # 加入tracks[i]
+                    interval_km = euclidean_distance(x1, y1, x2, y2) / 1000.0
+                    if interval_km > COMM_RANGE:
+                        itv_left = interval_km
+                        while itv_left > COMM_RANGE:
+                            ratio = (COMM_RANGE - 0.001) / itv_left     # 由于使用的球面距离计算，故而增加 1米 误差
+                            x_ = x1 + ratio * (x2 - x1)
+                            y_ = y1 + ratio * (y2 - y1)
+                            ev.track.append([float(x_), float(y_)])     # 插入新点
+                            x1, y1 = x_, y_
+                            itv_left -= (COMM_RANGE - 0.001)
+                else:
+                    x1, y1 = tracks[i].split(' ')
+                    ev.track.append([float(x1), float(y1)])  # 加入末尾节点
+
             ev.track_index = 0
+            ev.destination = ev.track[-1]
+            ev.set_charge()
             self.EVs.append(ev)
+            counter += 1
 
     def reset_world(self):
         """重置世界状态 — 保留实体当前位置/电量，仅清除运行时状态"""
@@ -98,24 +131,44 @@ class World:
         random.seed(self.seed_val)
         np.random.seed(self.seed_val)
 
-        # 重置实体: 保留 pos/remain, 清除充电/任务/邻居等运行时状态
-        for mcs in self.MCSs:
-            mcs.reset(list(mcs.pos), mcs.remain)
+        self.mcs_positions = [np.random.uniform(AREA_LON_MIN, AREA_LON_MAX, NUM_MCS),
+                              np.random.uniform(AREA_LAT_MIN, AREA_LAT_MAX, NUM_MCS)]
+        self.fcs_positions = [np.random.uniform(AREA_LON_MIN, AREA_LON_MAX, NUM_FCS),
+                              np.random.uniform(AREA_LAT_MIN, AREA_LAT_MAX, NUM_FCS)]
+
+        # reset mcs
+        for index, mcs in enumerate(self.MCSs):
+            init_pos = [float(self.mcs_positions[0][index]), float(self.mcs_positions[1][index])]
+            mcs.reset(init_pos)
+
+        # reset fcs
         for fcs in self.FCSs:
             fcs.reset()
-        for ev in self.EVs:
-            # 保存自定义轨迹 (reset 会清空 track)
-            saved_track = ev.track
-            saved_dest = ev.destination
-            saved_track_idx = ev.track_index
-            saved_arrived = ev.arrived
-            ev.reset(list(ev.pos), ev.remain, ev.total_distance)
-            # 恢复轨迹
-            ev.track = saved_track
-            ev.destination = saved_dest
-            ev.track_index = saved_track_idx
-            ev.arrived = saved_arrived
-            # track / track_index / destination / arrived 保留不重置
+
+        # reset ev
+        ev_track_data = pd.read_csv(TRACK_DATA_PATH)
+        shuffled_indices = ev_track_data.index.tolist()
+        random.shuffle(shuffled_indices)
+        for idx, ev in enumerate(self.EVs):
+            index = shuffled_indices[idx]
+            row = ev_track_data.loc[index]
+            remain = np.random.normal(loc=EV_POWER_MEAN, scale=EV_POWER_STD)
+            ev.reset([float(row['lng']), float(row['lat'])], remain)
+
+    def init_world_mini(self):
+        """初始化一个用于验证模型训练的小场景"""
+        ev1 = EV(1, [2000, 0], 20, 100)     # quasi
+        ev2 = EV(2, [0, 2000], 25, 100)     # quasi
+        ev3 = EV(3, [0, 4000], 5, 100)      # IEV
+        mcs1 = MCS(1, [0, 0])                                        # idle
+        mcs2 = MCS(2, [4000, 0], remain_kwh=60)                      # idle
+        fcs1 = FCS(1, [3000, 1000])                                   # avail
+        self.EVs.append(ev1)
+        self.EVs.append(ev2)
+        self.EVs.append(ev3)
+        self.MCSs.append(mcs1)
+        self.MCSs.append(mcs2)
+        self.FCSs.append(fcs1)
 
     # ============================================================
     # ① update(action_n) — 执行动作, 移动智能体, 更新环境
@@ -141,9 +194,22 @@ class World:
 
             dist_km = euclidean_distance(agent.pos[0], agent.pos[1], target_pos[0], target_pos[1]) / 1000.0
             if isinstance(agent, EV):
-                agent.pos = target_pos  # 对agent的调度 默认1step内能够抵达
+                # IEV 的 action 默认指向轨迹中的下一个点。轨迹游标、位置、
+                # 电量和状态必须全部在 World.update() 中统一更新。
+                if agent.track_index < len(agent.track) - 1:
+                    next_track_pos = agent.track[agent.track_index + 1]
+                    if np.allclose(
+                        target_pos,
+                        next_track_pos,
+                        rtol=0.0,
+                        atol=1e-10,
+                    ):
+                        agent.track_index += 1
+
+                agent.pos = list(target_pos)
                 agent.remain -= dist_km * POWER_UNIT
                 agent.set_charge()
+
                 # 统计指标更新
                 agent.total_wait_time_min += STEP_DURATION_MIN
                 agent.total_extra_dist_km += dist_km
@@ -155,6 +221,7 @@ class World:
                     agent.pos = target_pos
                     agent.remain -= dist_km * POWER_UNIT
                     if agent.remain < 0.0:
+                        agent.remain = 0.0
                         agent.is_broken = True  # 标记MCS抛锚
                         agent.is_idle = False
                     # 统计指标更新
@@ -174,15 +241,15 @@ class World:
 
         # ── 1d. 其他 EV 的更新 ──
         for ev in self.EVs:
-            # if ev.is_charged or ev.fail_charge:
-            #     continue
+            if ev.is_charged or ev.fail_charge:
+                continue
             if ev.is_normal or ev.fail_charge:
                 continue
             elif (ev.is_charged and ev.charge_pos is None) or ev.is_quasi:
-                ev.last_pos = ev.pos
+                ev.last_pos = list(ev.pos)
                 if ev.track_index < len(ev.track) - 1:
                     ev.track_index += 1
-                    ev.pos = ev.track[ev.track_index]
+                    ev.pos = list(ev.track[ev.track_index])
                     dist_km = euclidean_distance(ev.last_pos[0], ev.last_pos[1], ev.pos[0], ev.pos[1]) / 1000.0
                     ev.remain -= dist_km * POWER_UNIT  # dist 单位为米, 转为 km
                     ev.set_charge()
@@ -260,6 +327,10 @@ class World:
                     ev.near_available_fcs.append(fcs)
                 elif fcs.is_busy:
                     ev.near_busy_fcs.append(fcs)
+                if ev.is_quasi:
+                    fcs.near_quasi.append(ev)
+                if ev.is_iev:
+                    fcs.near_iev.append(ev)
 
         # IEV-IEV or IEV-quasi 邻居
         for i in range(len(iev_list)):
@@ -290,7 +361,6 @@ class World:
                 else:
                     quasi_list[i].near_quasi.append(quasi_list[j])
                     quasi_list[j].near_quasi.append(quasi_list[i])
-
         # MCS-MCS 邻居
         for i in range(len(self.MCSs)):
             for j in range(i + 1, len(self.MCSs)):
@@ -309,6 +379,25 @@ class World:
                     self.MCSs[j].near_idle_mcs.append(self.MCSs[i])
                 elif not self.MCSs[i].is_idle:
                     self.MCSs[j].near_task_mcs.append(self.MCSs[i])
+
+        # MCS-FCS 邻居
+        for i in range(len(self.MCSs)):
+            for j in range(len(self.FCSs)):
+                if self.MCSs[i].is_broken or self.MCSs[i].is_recharging:
+                    continue
+                dist_km = euclidean_distance(
+                    self.MCSs[i].pos[0], self.MCSs[i].pos[1],
+                    self.FCSs[j].pos[0], self.FCSs[j].pos[1]) / 1000.0
+                if dist_km > COMM_RANGE:
+                    continue
+                if self.MCSs[i].is_idle:
+                    self.FCSs[j].near_idle_mcs.append(self.MCSs[i])
+                else:
+                    self.FCSs[j].near_task_mcs.append(self.MCSs[i])
+                if self.FCSs[j].has_available_slot():
+                    self.MCSs[i].near_available_fcs.append(self.FCSs[j])
+                else:
+                    self.MCSs[i].near_busy_fcs.append(self.FCSs[j])
 
         # ── 生成新一轮 agents ──
         for ev in iev_list:
@@ -331,7 +420,7 @@ class World:
             if isinstance(agent, MCS):
                 new_obs_n.append(self.obs_builder.obs_mcs(agent))
             else:
-                new_obs_n.append(self.obs_builder.build_iev_obs(agent))
+                new_obs_n.append(self.obs_builder.obs_iev(agent))
 
         for agent in self.last_agents:
             if agent in self.agents:
@@ -347,11 +436,16 @@ class World:
                     old_obs_n.append({
                         'obs_self': np.zeros(MCS_FEAT_DIM_self, dtype=np.float32),
                         'obs_tgt': np.zeros((TOP_K_MCS_CANDIDATES, MCS_FEAT_DIM_tgt), dtype=np.float32),
+                        'mask': np.zeros(TOP_K_MCS_CANDIDATES, dtype=bool),
                         'done': True,
                     })
                 else:
-                    # 后续实现IEV侧调度时补充
-                    pass
+                    old_obs_n.append({
+                        'obs_self': np.zeros(EV_FEAT_DIM_self, dtype=np.float32),
+                        'obs_tgt': np.zeros((TOP_K_MCS_CANDIDATES, EV_FEAT_DIM_tgt), dtype=np.float32),
+                        'mask': np.zeros(TOP_K_MCS_CANDIDATES, dtype=bool),
+                        'done': True,
+                    })
 
         return new_obs_n, old_obs_n, done_n
 
@@ -415,7 +509,7 @@ class World:
 
         return {
             'step': self.current_step,
-            'num_iev': n_iev, 'num_quasi': n_quasi, 'num_charged': n_charging,
+            'num_iev': n_iev, 'num_quasi': n_quasi, 'num_charging': n_charging,
             'num_success': n_success, 'num_fail': n_fail,
             'num_idle_mcs': n_idle, 'num_task_mcs': n_task, 'num_recharge_mcs': n_recharging, 'num_broken': n_broken,
             'avail_slots': avail_slots, 'occ_slots': occ_slots,
