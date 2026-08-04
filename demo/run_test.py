@@ -370,6 +370,15 @@ if __name__ == "__main__":
                 "action_target_latitude": last_action.get("target_pos", [None, None])[1],
                 "reward": float(reward),
                 "reward_service": float(reward_components.get("service", 0.0)),
+                "reward_serve_attraction": float(
+                    reward_components.get("serve_attraction", 0.0)
+                ),
+                "reward_serve_competition": float(
+                    reward_components.get("serve_competition", 0.0)
+                ),
+                "reward_serve_potential_improvement": float(
+                    reward_components.get("serve_potential_improvement", 0.0)
+                ),
                 "reward_recharge": float(reward_components.get("recharge", 0.0)),
                 "reward_movement": float(reward_components.get("movement", 0.0)),
                 "reward_wait": float(reward_components.get("wait", 0.0)),
@@ -390,6 +399,22 @@ if __name__ == "__main__":
                 ),
                 "event_service_kwh": float(event.get("service_kwh", 0.0)),
                 "event_recharged_kwh": float(event.get("recharged_kwh", 0.0)),
+                "event_previous_attraction": float(
+                    event.get("previous_attraction", 0.0)
+                ),
+                "event_post_attraction": float(event.get("post_attraction", 0.0)),
+                "event_previous_competition": float(
+                    event.get("previous_competition", 0.0)
+                ),
+                "event_post_competition": float(
+                    event.get("post_competition", 0.0)
+                ),
+                "event_previous_spatial_potential": float(
+                    event.get("previous_spatial_potential", 0.0)
+                ),
+                "event_post_spatial_potential": float(
+                    event.get("post_spatial_potential", 0.0)
+                ),
                 "event_newly_broken": bool(event.get("newly_broken", False)),
                 "is_idle": mcs.is_idle,
                 "is_task": mcs.is_task,

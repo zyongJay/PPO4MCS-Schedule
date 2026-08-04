@@ -22,7 +22,7 @@ from typing import Dict, List
 import numpy as np
 
 from config import *
-from core import EV, MCS, euclidean_distance
+from core import EV, MCS, FCS, euclidean_distance
 
 
 class RewardBuilder:
@@ -48,13 +48,92 @@ class RewardBuilder:
     # MCS 奖励
     # ============================================================
 
-    def compute_mcs_reward(self, mcs: MCS, event: Dict, MCSState=None) -> Dict[str, float]:
-        """Return the MCS step reward together with auditable components.
+    def compute_mcs_spatial_features(
+        self,
+        mcs: MCS,
+        all_evs: List[EV],
+        all_mcss: List[MCS],
+        all_fcss: List[FCS],
+    ) -> Dict[str, float]:
+        """Return normalized local AP attraction and competition features.
 
-        Rewards are based on what actually happened during the step, not on a
-        fixed reward attached to the requested action.  This is also suitable
-        for accumulating option returns while an MCS is serving or recharging.
+        Although the full entity lists are passed by World, only objects inside
+        COMM_RANGE contribute.  The reward therefore uses the same local
+        information boundary as the MCS actor.
         """
+        eps = 1e-8
+        attraction_raw = 0.0
+        competition_raw = 0.0
+
+        for ev in all_evs:
+            if not (ev.is_quasi or ev.is_iev):
+                continue
+            dist_km = euclidean_distance(
+                mcs.pos[0], mcs.pos[1], ev.pos[0], ev.pos[1]
+            ) / 1000.0
+            if dist_km > COMM_RANGE:
+                continue
+            proximity = max(1.0 - dist_km / max(COMM_RANGE, eps), 0.0)
+            need_ratio = float(np.clip(
+                ev.need_power / max(MAX_CHARGE_PER_SESSION_KWH, eps),
+                0.0,
+                1.0,
+            ))
+            battery_urgency = 1.0 + float(np.clip(
+                1.0 - ev.remain / max(EV_BATTERY_CAPACITY, eps),
+                0.0,
+                1.0,
+            ))
+            iev_weight = 1.5 if ev.is_iev else 1.0
+            attraction_raw += (
+                iev_weight * battery_urgency * need_ratio * proximity
+            )
+
+        for other in all_mcss:
+            if other is mcs or other.is_broken or other.is_recharging:
+                continue
+            dist_km = euclidean_distance(
+                mcs.pos[0], mcs.pos[1], other.pos[0], other.pos[1]
+            ) / 1000.0
+            if dist_km > COMM_RANGE:
+                continue
+            proximity = max(1.0 - dist_km / max(COMM_RANGE, eps), 0.0)
+            available_energy = max(other.remain - other.charge_power_kwh, 0.0)
+            supply_ratio = min(
+                available_energy, MAX_CHARGE_PER_SESSION_KWH
+            ) / max(MAX_CHARGE_PER_SESSION_KWH, eps)
+            competition_raw += supply_ratio * proximity
+
+        for fcs in all_fcss:
+            if not fcs.has_available_slot():
+                continue
+            dist_km = euclidean_distance(
+                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
+            ) / 1000.0
+            if dist_km > COMM_RANGE:
+                continue
+            proximity = max(1.0 - dist_km / max(COMM_RANGE, eps), 0.0)
+            slot_ratio = fcs.available_slots / max(fcs.capacity, 1)
+            competition_raw += slot_ratio * proximity
+
+        # Saturating transforms retain sensitivity in sparse neighborhoods and
+        # keep every AP component in [0, 1].
+        attraction = 1.0 - np.exp(-attraction_raw)
+        competition = 1.0 - np.exp(-competition_raw)
+        potential = float(np.clip(attraction - competition, -1.0, 1.0))
+        return {
+            'attraction': float(np.clip(attraction, 0.0, 1.0)),
+            'competition': float(np.clip(competition, 0.0, 1.0)),
+            'potential': potential,
+        }
+
+    def compute_mcs_reward(
+        self,
+        mcs: MCS,
+        event: Dict,
+        MCSState=None,
+    ) -> Dict[str, float]:
+        """Return outcome rewards plus immediate AP shaping components."""
         max_move_energy = max(
             (MAX_MOVE_PER_STEP / 1000.0) * POWER_UNIT,
             1e-8,
@@ -62,21 +141,45 @@ class RewardBuilder:
         service_kwh = max(float(event.get('service_kwh', 0.0)), 0.0)
         recharged_kwh = max(float(event.get('recharged_kwh', 0.0)), 0.0)
         movement_energy = max(float(event.get('movement_energy_kwh', 0.0)), 0.0)
+        requested_mode = event.get('requested_mode', '')
 
         previous_remain = float(event.get('previous_remain_kwh', mcs.remain))
         current_remain = float(event.get('current_remain_kwh', mcs.remain))
         threshold = max(float(MCS_RECHARGE_THRESHOLD), 1e-8)
-        previous_risk = float(np.clip((threshold - previous_remain) / threshold, 0.0, 1.0))
-        current_risk = float(np.clip((threshold - current_remain) / threshold, 0.0, 1.0))
+        previous_risk = float(np.clip(
+            (threshold - previous_remain) / threshold, 0.0, 1.0
+        ))
+        current_risk = float(np.clip(
+            (threshold - current_remain) / threshold, 0.0, 1.0
+        ))
+
+        post_attraction = float(event.get('post_attraction', 0.0))
+        post_competition = float(event.get('post_competition', 0.0))
+        previous_potential = float(event.get('previous_spatial_potential', 0.0))
+        post_potential = float(event.get('post_spatial_potential', 0.0))
+        is_serve_decision = requested_mode == 'Serve'
 
         components = {
+            # Sparse final outcome reward retained for long-term credit.
             'service': service_kwh / max(MAX_CHARGE_PER_SESSION_KWH, 1e-8),
-            'recharge': recharged_kwh / max(MAX_RECHARGE_PER_SESSION_KWH, 1e-8),
+            # Every Serve tracking step now receives immediate local AP feedback.
+            'serve_attraction': 0.25 * post_attraction if is_serve_decision else 0.0,
+            'serve_competition': -0.10 * post_competition if is_serve_decision else 0.0,
+            'serve_potential_improvement': (
+                0.15 * (post_potential - previous_potential)
+                if is_serve_decision else 0.0
+            ),
+            # Recharge energy itself is weakly rewarded; risk reduction is the
+            # primary recharge signal, avoiding the previous recharge bias.
+            'recharge': (
+                0.05 * recharged_kwh /
+                max(MAX_RECHARGE_PER_SESSION_KWH, 1e-8)
+            ),
             'movement': -0.10 * movement_energy / max_move_energy,
             'wait': -0.02 if event.get('waited', False) else 0.0,
             'recharge_match_failure': (
                 -0.05
-                if event.get('requested_mode') == 'Recharge'
+                if requested_mode == 'Recharge'
                 and not event.get('recharge_matched', False)
                 else 0.0
             ),

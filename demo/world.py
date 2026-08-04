@@ -184,8 +184,14 @@ class World:
         """Execute actions and record one auditable event for every MCS."""
         previous_mcs_state = {}
         for mcs in self.MCSs:
+            spatial = self.reward_builder.compute_mcs_spatial_features(
+                mcs, self.EVs, self.MCSs, self.FCSs
+            )
             previous_mcs_state[mcs.id] = {
                 'remain': float(mcs.remain),
+                'spatial_attraction': spatial['attraction'],
+                'spatial_competition': spatial['competition'],
+                'spatial_potential': spatial['potential'],
                 'pos': list(mcs.pos),
                 'is_broken': bool(mcs.is_broken),
                 'is_idle': bool(mcs.is_idle),
@@ -286,6 +292,12 @@ class World:
         events = {}
         for mcs in self.MCSs:
             previous = previous_mcs_state[mcs.id]
+            if (
+                previous['is_idle']
+                and not previous['is_broken']
+                and not previous['is_recharging']
+            ):
+                mcs.total_idle_time_min += STEP_DURATION_MIN
             action = action_by_mcs_id.get(mcs.id, {})
             moved_distance_km = euclidean_distance(
                 previous['pos'][0], previous['pos'][1], mcs.pos[0], mcs.pos[1]
@@ -311,6 +323,9 @@ class World:
                 'battery_delta_kwh': float(battery_delta),
                 'previous_remain_kwh': float(previous['remain']),
                 'current_remain_kwh': float(mcs.remain),
+                'previous_attraction': float(previous['spatial_attraction']),
+                'previous_competition': float(previous['spatial_competition']),
+                'previous_spatial_potential': float(previous['spatial_potential']),
                 'newly_broken': bool(mcs.is_broken and not previous['is_broken']),
                 'became_idle': bool(mcs.is_idle and not previous['is_idle']),
                 'became_task': bool(mcs.is_task and not previous['is_task']),
@@ -537,6 +552,12 @@ class World:
         self.last_mcs_reward_components = {}
         for mcs in self.MCSs:
             event = self.mcs_step_events.get(mcs.id, {})
+            post_spatial = self.reward_builder.compute_mcs_spatial_features(
+                mcs, self.EVs, self.MCSs, self.FCSs
+            )
+            event['post_attraction'] = post_spatial['attraction']
+            event['post_competition'] = post_spatial['competition']
+            event['post_spatial_potential'] = post_spatial['potential']
             components = self.reward_builder.compute_mcs_reward(mcs, event)
             self.last_mcs_reward_components[mcs.id] = components
             mcs.total_reward += components['total']

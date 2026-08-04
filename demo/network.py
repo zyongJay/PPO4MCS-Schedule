@@ -1,343 +1,315 @@
-"""
-demo/network.py — Option-inspired MAPPO 网络模块 (无GNN, 纯MLP)
+"""Neural networks for option-aware MCS-only MAPPO/PPO training.
 
-包含:
-  - MCSHighActor:      模式选择策略 π_mode(z|obs) → Serve/Recharge
-  - MCSLowActor:       条件目标选择策略 π_target(a|obs, z=Serve) → quasi EV 候选
-  - IEVActor:          IEV等待目标选择策略 → task MCS / occupied FCS 候选
-  - CentralizedCritic: 中心化价值网络 V(global_state) → 标量
-
-所有 Actor 均支持动态候选数量 (无padding), 逐候选计算 score → softmax。
+High actions use the fixed indices 0=Serve, 1=Recharge, 2=Wait.  Both actor
+levels apply boolean masks directly to logits; True means the action/candidate
+was physically valid at sampling time.  IEV movement is environment-controlled
+and has no trainable actor in this module.
 """
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Categorical
-from typing import List, Tuple, Optional, Dict
+
+TensorLike = Union[np.ndarray, torch.Tensor]
+MCS_ACTION_NAMES = ("Serve", "Recharge", "Wait")
 
 
-# ============================================================
-# MCS High Actor — 模式选择 (Serve / Recharge)
-# ============================================================
+def masked_categorical(
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> Tuple[Categorical, torch.Tensor]:
+    """Create a categorical distribution after masking invalid logits.
+
+    ``valid_mask`` must have the same shape as ``logits`` and uses True for a
+    valid action.  At least one action must be valid in every batch row.
+    """
+    mask = valid_mask.to(device=logits.device, dtype=torch.bool)
+    if mask.shape != logits.shape:
+        raise ValueError(
+            f"mask shape {tuple(mask.shape)} != logits shape {tuple(logits.shape)}"
+        )
+    if not torch.all(mask.any(dim=-1)):
+        raise ValueError("each categorical row must contain at least one valid action")
+    dtype_min = torch.finfo(logits.dtype).min
+    masked_logits = logits.masked_fill(~mask, dtype_min)
+    return Categorical(logits=masked_logits), masked_logits
+
 
 class MCSHighActor(nn.Module):
-    """MCS 高层策略: 输入自身状态+环境统计, 输出 Serve/Recharge 概率"""
+    """Local High Actor: normalized high state -> Serve/Recharge/Wait logits."""
 
     def __init__(self, state_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2),  # Serve, Recharge
+            nn.Tanh(),
+            nn.Linear(hidden_dim, len(MCS_ACTION_NAMES)),
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """返回 logits [batch, 2]"""
         return self.net(state)
 
-    def get_action(self, state: torch.Tensor) -> Tuple[int, float, torch.Tensor]:
-        """
-        采样动作并返回 (mode_idx, log_prob, logits).
-        state: [state_dim] 或 [batch, state_dim]
-        """
-        logits = self.forward(state.unsqueeze(0) if state.dim() == 1 else state)
-        probs = F.softmax(logits, dim=-1)
-        dist = Categorical(probs)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return action.item(), log_prob, logits
+    def distribution(
+        self,
+        state: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> Categorical:
+        logits = self.forward(state)
+        distribution, _ = masked_categorical(logits, action_mask)
+        return distribution
 
-
-# ============================================================
-# MCS Low Actor — 条件目标选择 (仅 Serve 模式)
-# ============================================================
 
 class MCSLowActor(nn.Module):
-    """
-    MCS 低层策略: 在 Serve 模式下选择 quasi EV 跟踪目标。
-    动态动作空间 — 逐候选编码 → score → softmax。
-    """
+    """Conditional Low Actor that scores the padded quasi candidate set."""
 
-    def __init__(self, self_dim: int, cand_dim: int, hidden_dim: int = 128):
+    def __init__(self, self_dim: int, candidate_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.self_encoder = nn.Sequential(
             nn.Linear(self_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
         )
-        self.cand_encoder = nn.Sequential(
-            nn.Linear(cand_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.score_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, self_state: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
-        """
-        self_state: [self_dim]
-        candidates: [N, cand_dim], N 可变
-        返回: [N] scores (logits)
-        """
-        h_self = self.self_encoder(self_state.unsqueeze(0))  # [1, hidden_dim]
-        h_cand = self.cand_encoder(candidates)               # [N, hidden_dim]
-        h_self_exp = h_self.expand(len(candidates), -1)       # [N, hidden_dim]
-        h_concat = torch.cat([h_self_exp, h_cand], dim=-1)   # [N, hidden_dim*2]
-        scores = self.score_head(h_concat).squeeze(-1)        # [N]
-        return scores
-
-    def get_action(self, self_state: torch.Tensor, candidates: torch.Tensor
-                   ) -> Tuple[Optional[int], Optional[float], Optional[torch.Tensor]]:
-        """
-        采样目标候选索引。
-        若 candidates 为空, 返回 (None, None, None)。
-        """
-        if candidates.shape[0] == 0:
-            return None, None, None
-        scores = self.forward(self_state, candidates)
-        probs = F.softmax(scores, dim=-1)
-        dist = Categorical(probs)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return action.item(), log_prob, scores
-
-
-# ============================================================
-# IEV Actor — 等待目标选择
-# ============================================================
-
-class IEVActor(nn.Module):
-    """
-    IEV 策略: 选择等待目标 (task MCS / occupied FCS)。
-    动态动作空间 — 逐候选编码 → score → softmax。
-    """
-
-    def __init__(self, self_dim: int, cand_dim: int, hidden_dim: int = 128):
-        super().__init__()
-        self.self_encoder = nn.Sequential(
-            nn.Linear(self_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.cand_encoder = nn.Sequential(
-            nn.Linear(cand_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        self.candidate_encoder = nn.Sequential(
+            nn.Linear(candidate_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
         )
         self.score_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, self_state: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
-        h_self = self.self_encoder(self_state.unsqueeze(0))
-        h_cand = self.cand_encoder(candidates)
-        h_self_exp = h_self.expand(len(candidates), -1)
-        h_concat = torch.cat([h_self_exp, h_cand], dim=-1)
-        scores = self.score_head(h_concat).squeeze(-1)
-        return scores
+    def forward(
+        self,
+        self_state: torch.Tensor,
+        candidates: torch.Tensor,
+    ) -> torch.Tensor:
+        unbatched = self_state.dim() == 1
+        if unbatched:
+            self_state = self_state.unsqueeze(0)
+        if candidates.dim() == 2:
+            candidates = candidates.unsqueeze(0)
+        if self_state.shape[0] != candidates.shape[0]:
+            raise ValueError("low self-state and candidate batch sizes differ")
 
-    def get_action(self, self_state: torch.Tensor, candidates: torch.Tensor
-                   ) -> Tuple[Optional[int], Optional[float], Optional[torch.Tensor]]:
-        if candidates.shape[0] == 0:
-            return None, None, None
-        scores = self.forward(self_state, candidates)
-        probs = F.softmax(scores, dim=-1)
-        dist = Categorical(probs)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return action.item(), log_prob, scores
+        self_embedding = self.self_encoder(self_state)
+        candidate_embedding = self.candidate_encoder(candidates)
+        expanded_self = self_embedding.unsqueeze(1).expand(
+            -1, candidates.shape[1], -1
+        )
+        logits = self.score_head(
+            torch.cat((expanded_self, candidate_embedding), dim=-1)
+        ).squeeze(-1)
+        return logits.squeeze(0) if unbatched else logits
 
+    def distribution(
+        self,
+        self_state: torch.Tensor,
+        candidates: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> Categorical:
+        logits = self.forward(self_state, candidates)
+        distribution, _ = masked_categorical(logits, candidate_mask)
+        return distribution
 
-# ============================================================
-# Centralized Critic — 中心化价值网络
-# ============================================================
 
 class CentralizedCritic(nn.Module):
-    """CTDE 中心化 Critic: 输入全局状态, 输出标量 V(s)"""
+    """Centralized value function over a normalized fixed-width global state."""
 
     def __init__(self, state_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, global_state: torch.Tensor) -> torch.Tensor:
-        """global_state: [batch, state_dim] → [batch, 1]"""
-        return self.net(global_state)
+        return self.net(global_state).squeeze(-1)
 
 
-# ============================================================
-# MAPPO Agent — 包装所有网络
-# ============================================================
+class MCSMAPPOAgent:
+    """MCS-only High/Low actors, centralized critic, and their optimizers."""
 
-class MAPPOAgent:
-    """MAPPO 智能体容器: 包含所有 Actor/Critic 网络及优化器"""
-
-    def __init__(self,
-                 mcs_high_dim: int, mcs_low_self_dim: int, mcs_low_cand_dim: int,
-                 iev_self_dim: int, iev_cand_dim: int,
-                 global_state_dim: int,
-                 hidden_dim: int = 128,
-                 lr_actor: float = 3e-4, lr_critic: float = 1e-3,
-                 device: str = 'cpu'):
+    def __init__(
+        self,
+        high_state_dim: int,
+        low_self_dim: int,
+        low_candidate_dim: int,
+        critic_state_dim: int,
+        hidden_dim: int = 128,
+        actor_lr: float = 3e-4,
+        critic_lr: float = 1e-3,
+        device: str = "cpu",
+    ):
         self.device = torch.device(device)
+        self.high_actor = MCSHighActor(high_state_dim, hidden_dim).to(self.device)
+        self.low_actor = MCSLowActor(
+            low_self_dim, low_candidate_dim, hidden_dim
+        ).to(self.device)
+        self.critic = CentralizedCritic(critic_state_dim, hidden_dim).to(self.device)
+        self.high_optimizer = torch.optim.Adam(
+            self.high_actor.parameters(), lr=actor_lr
+        )
+        self.low_optimizer = torch.optim.Adam(
+            self.low_actor.parameters(), lr=actor_lr
+        )
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(), lr=critic_lr
+        )
 
-        # Actor 网络
-        self.mcs_high_actor = MCSHighActor(mcs_high_dim, hidden_dim).to(self.device)
-        self.mcs_low_actor = MCSLowActor(mcs_low_self_dim, mcs_low_cand_dim, hidden_dim).to(self.device)
-        self.iev_actor = IEVActor(iev_self_dim, iev_cand_dim, hidden_dim).to(self.device)
-
-        # Critic 网络
-        self.critic = CentralizedCritic(global_state_dim, hidden_dim).to(self.device)
-
-        # 优化器
-        self.high_optimizer = torch.optim.Adam(self.mcs_high_actor.parameters(), lr=lr_actor)
-        self.low_optimizer = torch.optim.Adam(self.mcs_low_actor.parameters(), lr=lr_actor)
-        self.iev_optimizer = torch.optim.Adam(self.iev_actor.parameters(), lr=lr_actor)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
-
-        self.train()
-
-    def train(self):
-        self.mcs_high_actor.train()
-        self.mcs_low_actor.train()
-        self.iev_actor.train()
+    def train(self) -> None:
+        self.high_actor.train()
+        self.low_actor.train()
         self.critic.train()
 
-    def eval(self):
-        self.mcs_high_actor.eval()
-        self.mcs_low_actor.eval()
-        self.iev_actor.eval()
+    def eval(self) -> None:
+        self.high_actor.eval()
+        self.low_actor.eval()
         self.critic.eval()
 
-    def get_value(self, global_state: torch.Tensor) -> float:
-        """获取全局状态的价值估计"""
-        with torch.no_grad():
-            if global_state.dim() == 1:
-                global_state = global_state.unsqueeze(0)
-            return self.critic(global_state.to(self.device)).item()
+    def _tensor(self, value: TensorLike, dtype=torch.float32) -> torch.Tensor:
+        return torch.as_tensor(value, dtype=dtype, device=self.device)
 
-    def select_mcs_action(self, high_state: torch.Tensor,
-                          low_self_state: torch.Tensor,
-                          low_candidates: torch.Tensor
-                          ) -> Dict:
-        """
-        MCS 动作选择 (两级决策)。
+    @torch.no_grad()
+    def get_values_batch(self, critic_states: TensorLike) -> np.ndarray:
+        states = self._tensor(critic_states)
+        if states.dim() == 1:
+            states = states.unsqueeze(0)
+        return self.critic(states).detach().cpu().numpy()
 
-        Returns:
-            {'mode': 'Serve'|'Recharge',
-             'mode_idx': int,
-             'log_prob_mode': float,
-             'target_idx': int or None,
-             'log_prob_target': float or None,
-             'total_log_prob': float}
-        """
-        with torch.no_grad():
-            mode_idx, log_prob_mode, _ = self.mcs_high_actor.get_action(
-                high_state.to(self.device))
-            mode = 'Serve' if mode_idx == 0 else 'Recharge'
+    @torch.no_grad()
+    def get_value(self, critic_state: TensorLike) -> float:
+        return float(self.get_values_batch(critic_state)[0])
 
-            if mode == 'Serve':
-                target_idx, log_prob_target, _ = self.mcs_low_actor.get_action(
-                    low_self_state.to(self.device),
-                    low_candidates.to(self.device))
-                total_log_prob = log_prob_mode
-                if log_prob_target is not None:
-                    total_log_prob = total_log_prob + log_prob_target
-            else:
-                target_idx = None
-                log_prob_target = None
-                total_log_prob = log_prob_mode
+    @torch.no_grad()
+    def select_mcs_actions_batch(self, observations: list[Dict]) -> list[Dict]:
+        """Sample High actions and the Serve-only Low subset in two GPU batches."""
+        if not observations:
+            return []
+        high_states = self._tensor(np.stack([
+            observation['high_state'] for observation in observations
+        ]))
+        high_masks = self._tensor(np.stack([
+            observation['high_action_mask'] for observation in observations
+        ]), dtype=torch.bool)
+        high_distribution = self.high_actor.distribution(
+            high_states, high_masks
+        )
+        high_actions = high_distribution.sample()
+        high_log_probs = high_distribution.log_prob(high_actions)
 
-        return {
-            'mode': mode, 'mode_idx': mode_idx,
-            'log_prob_mode': log_prob_mode,
-            'target_idx': target_idx,
-            'log_prob_target': log_prob_target,
-            'total_log_prob': total_log_prob,
+        action_indices = high_actions.detach().cpu().numpy().astype(int)
+        high_log_prob_values = high_log_probs.detach().cpu().numpy()
+        results = [{
+            'mode': MCS_ACTION_NAMES[action_index],
+            'high_action': int(action_index),
+            'high_log_prob': float(high_log_prob_values[index]),
+            'low_action': -1,
+            'low_log_prob': 0.0,
+        } for index, action_index in enumerate(action_indices)]
+
+        serve_indices = np.flatnonzero(action_indices == 0)
+        if serve_indices.size:
+            low_self_states = self._tensor(np.stack([
+                observations[index]['low_self_state']
+                for index in serve_indices
+            ]))
+            low_candidates = self._tensor(np.stack([
+                observations[index]['low_candidates']
+                for index in serve_indices
+            ]))
+            low_masks = self._tensor(np.stack([
+                observations[index]['low_candidate_mask']
+                for index in serve_indices
+            ]), dtype=torch.bool)
+            low_distribution = self.low_actor.distribution(
+                low_self_states, low_candidates, low_masks
+            )
+            low_actions = low_distribution.sample()
+            low_log_probs = low_distribution.log_prob(low_actions)
+            low_action_values = low_actions.detach().cpu().numpy().astype(int)
+            low_log_prob_values = low_log_probs.detach().cpu().numpy()
+            for batch_index, observation_index in enumerate(serve_indices):
+                results[int(observation_index)]['low_action'] = int(
+                    low_action_values[batch_index]
+                )
+                results[int(observation_index)]['low_log_prob'] = float(
+                    low_log_prob_values[batch_index]
+                )
+        return results
+
+    @torch.no_grad()
+    def select_mcs_action(self, observation: Dict) -> Dict:
+        return self.select_mcs_actions_batch([observation])[0]
+
+    def evaluate_high(
+        self,
+        states: torch.Tensor,
+        masks: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        distribution = self.high_actor.distribution(
+            states.to(self.device), masks.to(self.device)
+        )
+        actions = actions.to(self.device)
+        return distribution.log_prob(actions), distribution.entropy()
+
+    def evaluate_low(
+        self,
+        self_states: torch.Tensor,
+        candidates: torch.Tensor,
+        masks: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        distribution = self.low_actor.distribution(
+            self_states.to(self.device),
+            candidates.to(self.device),
+            masks.to(self.device),
+        )
+        actions = actions.to(self.device)
+        return distribution.log_prob(actions), distribution.entropy()
+
+    def values(self, critic_states: torch.Tensor) -> torch.Tensor:
+        return self.critic(critic_states.to(self.device))
+
+    def save(self, path: Union[str, Path], metadata: Dict | None = None) -> None:
+        checkpoint = {
+            "high_actor": self.high_actor.state_dict(),
+            "low_actor": self.low_actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "high_optimizer": self.high_optimizer.state_dict(),
+            "low_optimizer": self.low_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "metadata": metadata or {},
         }
+        torch.save(checkpoint, Path(path))
 
-    def select_iev_action(self, self_state: torch.Tensor,
-                          candidates: torch.Tensor) -> Dict:
-        """IEV 动作选择。"""
-        with torch.no_grad():
-            target_idx, log_prob_target, _ = self.iev_actor.get_action(
-                self_state.to(self.device),
-                candidates.to(self.device))
-        return {
-            'target_idx': target_idx,
-            'log_prob_target': log_prob_target if log_prob_target is not None else 0.0,
-            'total_log_prob': log_prob_target if log_prob_target is not None else 0.0,
-        }
+    def load(self, path: Union[str, Path]) -> Dict:
+        checkpoint = torch.load(
+            Path(path), map_location=self.device, weights_only=False
+        )
+        self.high_actor.load_state_dict(checkpoint["high_actor"])
+        self.low_actor.load_state_dict(checkpoint["low_actor"])
+        self.critic.load_state_dict(checkpoint["critic"])
+        self.high_optimizer.load_state_dict(checkpoint["high_optimizer"])
+        self.low_optimizer.load_state_dict(checkpoint["low_optimizer"])
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+        return checkpoint.get("metadata", {})
 
-    def evaluate_mcs_high(self, high_states: torch.Tensor, mode_actions: torch.Tensor
-                          ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """批量评估 High Actor: 返回 (log_probs, entropies)"""
-        logits = self.mcs_high_actor(high_states.to(self.device))
-        probs = F.softmax(logits, dim=-1)
-        dist = Categorical(probs)
-        log_probs = dist.log_prob(mode_actions.to(self.device))
-        entropies = dist.entropy()
-        return log_probs, entropies
 
-    def evaluate_mcs_low(self, self_states: torch.Tensor,
-                         candidates_list: List[torch.Tensor],
-                         target_actions: torch.Tensor
-                         ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """批量评估 Low Actor: 逐样本计算, 返回 (log_probs, entropies)"""
-        log_probs = []
-        entropies = []
-        for i, (ss, cand, act) in enumerate(zip(self_states, candidates_list, target_actions)):
-            ss = ss.to(self.device)
-            cand = cand.to(self.device)
-            if cand.shape[0] == 0 or act.item() < 0:
-                log_probs.append(torch.tensor(0.0, device=self.device))
-                entropies.append(torch.tensor(0.0, device=self.device))
-            else:
-                scores = self.mcs_low_actor(ss, cand)
-                probs = F.softmax(scores, dim=-1)
-                dist = Categorical(probs)
-                lp = dist.log_prob(act.to(self.device))
-                ent = dist.entropy()
-                log_probs.append(lp)
-                entropies.append(ent)
-        return torch.stack(log_probs), torch.stack(entropies)
-
-    def evaluate_iev(self, self_states: torch.Tensor,
-                     candidates_list: List[torch.Tensor],
-                     target_actions: torch.Tensor
-                     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """批量评估 IEV Actor: 逐样本计算"""
-        log_probs = []
-        entropies = []
-        for i, (ss, cand, act) in enumerate(zip(self_states, candidates_list, target_actions)):
-            ss = ss.to(self.device)
-            cand = cand.to(self.device)
-            if cand.shape[0] == 0 or act.item() < 0:
-                log_probs.append(torch.tensor(0.0, device=self.device))
-                entropies.append(torch.tensor(0.0, device=self.device))
-            else:
-                scores = self.iev_actor(ss, cand)
-                probs = F.softmax(scores, dim=-1)
-                dist = Categorical(probs)
-                lp = dist.log_prob(act.to(self.device))
-                ent = dist.entropy()
-                log_probs.append(lp)
-                entropies.append(ent)
-        return torch.stack(log_probs), torch.stack(entropies)
-
-    def get_critic_value(self, global_states: torch.Tensor) -> torch.Tensor:
-        return self.critic(global_states.to(self.device))
+# Backward-compatible name for callers that previously imported MAPPOAgent.
+MAPPOAgent = MCSMAPPOAgent

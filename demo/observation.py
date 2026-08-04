@@ -262,107 +262,78 @@ class ObservationBuilder:
 
         return obs
 
-    def build_global_state(self, EVs: List[EV], MCSs: List[MCS], FCSs: List[FCS]) -> np.ndarray:
-        """
-        构造 Critic 使用的 6 维全局状态摘要。
-        特征顺序为 IEV 竞争、MCS 竞争、IEV 吸引、MCS 吸引、
-        成功充电率和 MCS 平均收益。距离以 km 为单位，统计范围使用
-        ``COMM_RANGE``。FCS 的 e 使用当前可服务电量表示。
-        """
-        region_km = float(2 * COMM_RANGE)
-        min_distance_km = 1e-6
-        ievs = [ev for ev in EVs if ev.is_iev]
-        demand_evs = [ev for ev in EVs if ev.is_iev or ev.is_quasi]
-        active_mcss = [mcs for mcs in MCSs if not mcs.is_broken and not mcs.is_recharging and mcs.is_idle]
+    def build_global_state(
+        self,
+        EVs: List[EV],
+        MCSs: List[MCS],
+        FCSs: List[FCS],
+    ) -> np.ndarray:
+        """Build a normalized, permutation-invariant 20-D critic state.
 
-        def distance_km(obj_a, obj_b) -> float:
-            return max(
-                euclidean_distance(
-                    obj_a.pos[0], obj_a.pos[1],
-                    obj_b.pos[0], obj_b.pos[1],
-                ) / 1000.0,
-                min_distance_km,
+        The actor remains local.  The centralized critic receives mean/max
+        pooling over seven per-MCS features plus six system summaries, so its
+        width is independent of NUM_MCS and no IEV policy output is required.
+        """
+        eps = 1e-8
+        per_mcs = []
+        profit_scale = max(
+            MAX_CHARGE_PER_SESSION_KWH * CHARGE_PRICE * MAX_STEPS_PER_EPISODE,
+            1.0,
+        )
+        for mcs in MCSs:
+            per_mcs.append([
+                np.clip(mcs.remain / max(MCS_BATTERY_CAPACITY, eps), 0.0, 1.0),
+                float(mcs.is_idle and not mcs.is_broken and not mcs.is_recharging),
+                float(mcs.is_task),
+                float(mcs.is_recharging),
+                float(mcs.is_broken),
+                np.clip(
+                    mcs.charge_power_kwh /
+                    max(MAX_CHARGE_PER_SESSION_KWH, eps),
+                    0.0,
+                    1.0,
+                ),
+                np.tanh(mcs.total_profit / profit_scale),
+            ])
+
+        if per_mcs:
+            mcs_matrix = np.asarray(per_mcs, dtype=np.float32)
+            pooled_mcs = np.concatenate(
+                (mcs_matrix.mean(axis=0), mcs_matrix.max(axis=0))
             )
+        else:
+            pooled_mcs = np.zeros(14, dtype=np.float32)
 
-        def mean_or_zero(values: List[float]) -> float:
-            return float(np.mean(values)) if values else 0.0
-
-        iev_competition_values: List[float] = []
-        for iev in ievs:
-            competition = 0.0
-            for other in ievs:
-                if other is iev:
-                    continue
-                dist = distance_km(iev, other)
-                if dist <= region_km:
-                    competition += float(other.need_power) / (dist + 1)
-            iev_competition_values.append(competition)
-        iev_competition = mean_or_zero(iev_competition_values)
-
-        mcs_competition_values: List[float] = []
-        for mcs in active_mcss:
-            competition = 0.0
-            for other in active_mcss:
-                if other is mcs:
-                    continue
-                dist = distance_km(mcs, other)
-                if dist <= region_km:
-                    competition += float(other.remain) / (dist + 1)
-            for fcs in FCSs:
-                dist = distance_km(mcs, fcs)
-                if dist <= region_km:
-                    available_energy = (
-                            float(fcs.available_slots)
-                            * float(MAX_CHARGE_PER_SESSION_KWH)
-                    )
-                    competition += available_energy / (dist + 1)
-            mcs_competition_values.append(competition)
-        mcs_competition = mean_or_zero(mcs_competition_values)
-
-        iev_attraction_values: List[float] = []
-        for iev in ievs:
-            attraction = 0.0
-            for mcs in active_mcss:
-                dist = distance_km(iev, mcs)
-                if dist <= region_km:
-                    attraction += float(mcs.remain) / (dist + 1)
-            iev_attraction_values.append(attraction)
-        iev_attraction = mean_or_zero(iev_attraction_values)
-
-        mcs_attraction_values: List[float] = []
-        for mcs in active_mcss:
-            attraction = 0.0
-            for ev in demand_evs:
-                dist = distance_km(mcs, ev)
-                if dist <= region_km:
-                    if ev.is_iev:
-                        attraction += 1.5 * float(ev.need_power) / (dist + 1)
-                    else:
-                        attraction += float(ev.need_power) / (dist + 1)
-            mcs_attraction_values.append(attraction)
-        mcs_attraction = mean_or_zero(mcs_attraction_values)
-
-        n_success = sum(
-            1 for ev in EVs if ev.is_charged and ev.charge_pos is None
+        total_evs = max(len(EVs), 1)
+        quasi_ratio = sum(ev.is_quasi for ev in EVs) / total_evs
+        iev_ratio = sum(ev.is_iev for ev in EVs) / total_evs
+        success_count = sum(
+            ev.is_charged and ev.charge_pos is None for ev in EVs
         )
-        n_fail = sum(1 for ev in EVs if ev.fail_charge)
-        n_finished = n_success + n_fail
-        success_rate = n_success / n_finished if n_finished > 0 else 0.0
-
-        avg_mcs_profit = (
-            sum(mcs.total_profit for mcs in MCSs) / len(MCSs)
-            if MCSs
-            else 0.0
+        failure_count = sum(ev.fail_charge for ev in EVs)
+        finished_count = success_count + failure_count
+        success_rate = success_count / finished_count if finished_count else 0.0
+        failure_rate = failure_count / finished_count if finished_count else 0.0
+        total_slots = max(sum(fcs.capacity for fcs in FCSs), 1)
+        available_slot_ratio = sum(
+            fcs.available_slots for fcs in FCSs
+        ) / total_slots
+        active_demands = [
+            ev.need_power for ev in EVs if ev.is_quasi or ev.is_iev
+        ]
+        mean_demand_ratio = (
+            np.mean(active_demands) / max(MAX_CHARGE_PER_SESSION_KWH, eps)
+            if active_demands else 0.0
         )
-
-        return np.asarray(
-            [
-                iev_competition,
-                mcs_competition,
-                iev_attraction,
-                mcs_attraction,
-                success_rate,
-                avg_mcs_profit,
-            ],
-            dtype=np.float32,
-        )
+        system_summary = np.asarray([
+            np.clip(quasi_ratio, 0.0, 1.0),
+            np.clip(iev_ratio, 0.0, 1.0),
+            np.clip(available_slot_ratio, 0.0, 1.0),
+            np.clip(success_rate, 0.0, 1.0),
+            np.clip(failure_rate, 0.0, 1.0),
+            np.clip(mean_demand_ratio, 0.0, 1.0),
+        ], dtype=np.float32)
+        state = np.concatenate((pooled_mcs, system_summary)).astype(np.float32)
+        if state.shape != (MCS_GLOBAL_STATE_DIM,):
+            raise RuntimeError(f'unexpected critic state shape: {state.shape}')
+        return state
