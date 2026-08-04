@@ -4,6 +4,28 @@ import numpy as np
 from config import *
 from core import EV, MCS, FCS, euclidean_distance
 
+MCS_HIGH_FEATURE_NAMES = (
+    'remain_ratio',
+    'nearest_fcs_distance_ratio',
+    'recharge_margin_ratio',
+    'local_available_slot_ratio',
+    'local_need_supply_ratio',
+    'near_quasi_count_ratio',
+    'near_iev_demand_ratio',
+)
+MCS_LOW_SELF_FEATURE_NAMES = (
+    'remain_ratio',
+    'local_need_supply_ratio',
+    'near_quasi_count_ratio',
+)
+MCS_LOW_CANDIDATE_FEATURE_NAMES = (
+    'need_power_ratio',
+    'distance_ratio',
+    'attraction_ratio',
+    'competition_mcs_ratio',
+    'competition_fcs_ratio',
+)
+
 
 # ============================================================
 # ObservationBuilder
@@ -15,105 +37,161 @@ class ObservationBuilder:
     """
 
     def obs_mcs(self, mcs: MCS):
-        """
-        针对 MCS-Low-Policy Actor
-        为 MCS智能体 构造观测特征矩阵obs(包括附近K_max个候选对象的特征 以及 自身的特征)
-        return obs, mask_arr
-        """
-        candidates: List[EV] = [ev for ev in mcs.near_quasi]
-        # 按照规则排序
-        if TOP_K_MCS_CANDIDATES and len(candidates) > 1:
-            candidates.sort(key=lambda ev: euclidean_distance(
-                mcs.pos[0], mcs.pos[1], ev.pos[0], ev.pos[1]))
-        # 取Top-K
-        if TOP_K_MCS_CANDIDATES and len(candidates) > TOP_K_MCS_CANDIDATES:
-            candidates = candidates[:TOP_K_MCS_CANDIDATES]
+        """Build normalized local observations for the MCS high/low actors.
 
-        # 构建观测特征矩阵：
-        features = []  # 特征矩阵   k_max * d_in_target(5)
-        mask = []  # mask向量  k_max
-        for quasi in candidates:
-            # 1.电量缺口
-            # 2.mcs-quasi二者间距离
-            dist_km = euclidean_distance(
-                mcs.pos[0], mcs.pos[1],
-                quasi.pos[0], quasi.pos[1]) / 1000.0
-            dist_km = dist_km / COMM_RANGE
-            # 3.附近 竞争 与
-            attraction: float = 0.0
-            competition_mcs: float = 0.0
-            competition_fcs: float = 0.0
-            attractors: List[EV] = quasi.near_quasi + quasi.near_iev
-            # 吸引: 目的地周围的 IEV and quasi
-            for other in attractors:
-                d_km = euclidean_distance(
-                    quasi.pos[0], quasi.pos[1],
-                    other.pos[0], other.pos[1]) / 1000.0
-                if other.is_iev:  # 附近有IEV更加分
-                    attraction += 1.5 * other.need_power / (d_km + 1)
-                else:
-                    attraction += other.need_power / (d_km + 1)
-            # 竞争: 目的地周围的 其他的 idle MCS
-            for cpt in quasi.near_idle_mcs:
-                if cpt.id == mcs.id:
-                    continue
-                d_km = euclidean_distance(
-                    quasi.pos[0], quasi.pos[1],
-                    cpt.pos[0], cpt.pos[1]) / 1000.0
-                competition_mcs += min(cpt.remain, MAX_CHARGE_PER_SESSION_KWH) / MAX_CHARGE_PER_SESSION_KWH / (d_km + 1)
-            # 附近的avail FCS
-            for cpt in quasi.near_available_fcs:
-                d_km = euclidean_distance(
-                    quasi.pos[0], quasi.pos[1],
-                    cpt.pos[0], cpt.pos[1]) / 1000.0
-                competition_fcs += cpt.available_slots * 1.0 / (d_km + 1)
-            features.append([quasi.need_power, dist_km, attraction, competition_mcs, competition_fcs])
-            mask.append(False)
+        Mask conventions intentionally differ from the legacy ``mask`` field:
+        ``high_action_mask`` and ``low_candidate_mask`` use True for a valid
+        choice.  The legacy ``mask`` alias keeps True for padding so existing
+        callers are not broken.
+        """
+        eps = 1e-8
+        candidates: List[EV] = [ev for ev in mcs.near_quasi if ev.is_quasi]
+        candidates.sort(
+            key=lambda ev: euclidean_distance(
+                mcs.pos[0], mcs.pos[1], ev.pos[0], ev.pos[1]
+            )
+        )
+        candidates = candidates[:TOP_K_MCS_CANDIDATES]
 
-        # MCS智能体自身的特征向量（d_self(3)）
-        need: float = 0.0
-        support: float = 0.0
-        nearest_dist = COMM_RANGE
+        # Only local, physically valid FCSs may enable the Recharge action.
+        reachable_fcs = []
         for fcs in mcs.near_available_fcs:
             dist_km = euclidean_distance(
-                mcs.pos[0], mcs.pos[1],
-                fcs.pos[0], fcs.pos[1]
+                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
             ) / 1000.0
-            if dist_km < nearest_dist:
-                nearest_dist = dist_km
-            support += MAX_CHARGE_PER_SESSION_KWH * fcs.available_slots
-        for m in mcs.near_idle_mcs:
-            support += min(m.remain, MAX_CHARGE_PER_SESSION_KWH)
-        for ev in mcs.near_iev:
-            need += ev.need_power
+            required_energy = dist_km * POWER_UNIT
+            if dist_km <= COMM_RANGE and mcs.remain > required_energy:
+                reachable_fcs.append((fcs, dist_km, required_energy))
+
+        need = sum(ev.need_power for ev in mcs.near_iev)
         for ev in mcs.near_quasi:
-            weight = min(EV_LOW_POWER_THRESHOLD / ev.remain, 1)
-            need += weight * ev.need_power
-        # 1.剩余电量占比
-        remain_ratio = mcs.remain / MCS_BATTERY_CAPACITY
-        # 2.安全程度
-        nearest_dist = nearest_dist / COMM_RANGE
-        safe_degree = remain_ratio / (1e-4 + nearest_dist)
-        # 3.附近电量供求比例
-        ns_rate = need / (1e-4 + need + support)
+            remain = max(float(ev.remain), eps)
+            need += min(EV_LOW_POWER_THRESHOLD / remain, 1.0) * ev.need_power
 
-        # 候选对象数量不足k_max时，用0补齐，mask矩阵
-        if len(candidates) < TOP_K_MCS_CANDIDATES:
-            pad_num = TOP_K_MCS_CANDIDATES - len(candidates)
-            for _ in range(pad_num):
-                zero_feature = [0.0] * MCS_FEAT_DIM_tgt
-                features.append(zero_feature)
-                mask.append(True)
+        support = sum(
+            MAX_CHARGE_PER_SESSION_KWH * fcs.available_slots
+            for fcs in mcs.near_available_fcs
+        )
+        support += sum(
+            min(other.remain, MAX_CHARGE_PER_SESSION_KWH)
+            for other in mcs.near_idle_mcs
+        )
+        local_need_supply_ratio = need / (need + support + eps)
 
-        obs_tgt = np.array(features)
-        obs_self = np.array([remain_ratio, safe_degree, ns_rate])
-        mask_arr = np.array(mask, dtype=bool)
-        obs = {"obs_self": obs_self,  # 观测特征向量 d_in_self
-               "obs_tgt": obs_tgt,  # 观测特征向量 k_max * d_in_target
-               "mask": mask_arr,  # 掩码向量 k_max
-               "done": False}
+        remain_ratio = float(np.clip(
+            mcs.remain / max(MCS_BATTERY_CAPACITY, eps), 0.0, 1.0
+        ))
+        if reachable_fcs:
+            _, nearest_dist_km, required_energy = min(
+                reachable_fcs, key=lambda item: item[1]
+            )
+            nearest_fcs_distance_ratio = nearest_dist_km / max(COMM_RANGE, eps)
+            recharge_margin_ratio = (
+                mcs.remain - required_energy
+            ) / max(MCS_BATTERY_CAPACITY, eps)
+        else:
+            nearest_fcs_distance_ratio = 1.0
+            recharge_margin_ratio = 0.0
 
-        return obs
+        local_slot_capacity = max(
+            len(mcs.near_available_fcs) * FCS_SLOTS_PER_STATION, 1
+        )
+        local_available_slots = sum(
+            fcs.available_slots for fcs in mcs.near_available_fcs
+        )
+        near_iev_demand = sum(ev.need_power for ev in mcs.near_iev)
+
+        high_state = np.asarray([
+            remain_ratio,
+            np.clip(nearest_fcs_distance_ratio, 0.0, 1.0),
+            np.clip(recharge_margin_ratio, 0.0, 1.0),
+            np.clip(local_available_slots / local_slot_capacity, 0.0, 1.0),
+            np.clip(local_need_supply_ratio, 0.0, 1.0),
+            np.clip(len(mcs.near_quasi) / max(TOP_K_MCS_CANDIDATES, 1), 0.0, 1.0),
+            np.clip(
+                near_iev_demand /
+                max(TOP_K_MCS_CANDIDATES * MAX_CHARGE_PER_SESSION_KWH, eps),
+                0.0,
+                1.0,
+            ),
+        ], dtype=np.float32)
+        high_action_mask = np.asarray([
+            bool(candidates),       # 0 = Serve
+            bool(reachable_fcs),    # 1 = Recharge
+            True,                   # 2 = Wait
+        ], dtype=bool)
+
+        candidate_features = []
+        candidate_ids = []
+        for quasi in candidates:
+            dist_km = euclidean_distance(
+                mcs.pos[0], mcs.pos[1], quasi.pos[0], quasi.pos[1]
+            ) / 1000.0
+            attraction = 0.0
+            competition_mcs = 0.0
+            competition_fcs = 0.0
+
+            for other in quasi.near_quasi + quasi.near_iev:
+                other_dist_km = euclidean_distance(
+                    quasi.pos[0], quasi.pos[1], other.pos[0], other.pos[1]
+                ) / 1000.0
+                weight = 1.5 if other.is_iev else 1.0
+                attraction += weight * other.need_power / (other_dist_km + 1.0)
+
+            for other in quasi.near_idle_mcs:
+                if other.id == mcs.id:
+                    continue
+                other_dist_km = euclidean_distance(
+                    quasi.pos[0], quasi.pos[1], other.pos[0], other.pos[1]
+                ) / 1000.0
+                competition_mcs += (
+                    min(other.remain, MAX_CHARGE_PER_SESSION_KWH) /
+                    max(MAX_CHARGE_PER_SESSION_KWH, eps) /
+                    (other_dist_km + 1.0)
+                )
+
+            for fcs in quasi.near_available_fcs:
+                other_dist_km = euclidean_distance(
+                    quasi.pos[0], quasi.pos[1], fcs.pos[0], fcs.pos[1]
+                ) / 1000.0
+                competition_fcs += fcs.available_slots / (other_dist_km + 1.0)
+
+            candidate_features.append([
+                np.clip(quasi.need_power / max(MAX_CHARGE_PER_SESSION_KWH, eps), 0.0, 1.0),
+                np.clip(dist_km / max(COMM_RANGE, eps), 0.0, 1.0),
+                np.clip(attraction / (attraction + MAX_CHARGE_PER_SESSION_KWH + eps), 0.0, 1.0),
+                np.clip(competition_mcs / (competition_mcs + 1.0), 0.0, 1.0),
+                np.clip(competition_fcs / (competition_fcs + 1.0), 0.0, 1.0),
+            ])
+            candidate_ids.append(int(quasi.id))
+
+        valid_count = len(candidate_features)
+        while len(candidate_features) < TOP_K_MCS_CANDIDATES:
+            candidate_features.append([0.0] * MCS_FEAT_DIM_tgt)
+            candidate_ids.append(-1)
+
+        low_candidates = np.asarray(candidate_features, dtype=np.float32)
+        low_candidate_mask = np.zeros(TOP_K_MCS_CANDIDATES, dtype=bool)
+        low_candidate_mask[:valid_count] = True
+        low_self_state = np.asarray([
+            remain_ratio,
+            np.clip(local_need_supply_ratio, 0.0, 1.0),
+            np.clip(len(mcs.near_quasi) / max(TOP_K_MCS_CANDIDATES, 1), 0.0, 1.0),
+        ], dtype=np.float32)
+
+        return {
+            'high_state': high_state,
+            'high_action_mask': high_action_mask,
+            'low_self_state': low_self_state,
+            'low_candidates': low_candidates,
+            'low_candidate_mask': low_candidate_mask,
+            'candidate_ids': np.asarray(candidate_ids, dtype=np.int64),
+            # Backward-compatible aliases used by the current baseline script.
+            'obs_self': low_self_state,
+            'obs_tgt': low_candidates,
+            'mask': np.logical_not(low_candidate_mask),
+            'done': False,
+        }
 
     def obs_iev(self, iev: EV):
         """

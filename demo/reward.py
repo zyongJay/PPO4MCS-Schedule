@@ -48,94 +48,43 @@ class RewardBuilder:
     # MCS 奖励
     # ============================================================
 
-    def compute_mcs_reward(self, mcs: MCS, info: Dict, MCSState=None) -> float:
-        """计算单个 MCS 智能体的步级奖励。
+    def compute_mcs_reward(self, mcs: MCS, event: Dict, MCSState=None) -> Dict[str, float]:
+        """Return the MCS step reward together with auditable components.
 
-        参照 env/world.py MCS 局部奖励:
-          1. quasi 吸引力 (紧急度主导)
-          2. 竞争惩罚 (附近其他 idle/task MCS)
-          3. 移动开销惩罚
-          4. 空闲惩罚 / 附近失败 IEV 惩罚
-          5. Credit Assignment: 成功接单奖励
+        Rewards are based on what actually happened during the step, not on a
+        fixed reward attached to the requested action.  This is also suitable
+        for accumulating option returns while an MCS is serving or recharging.
         """
-        r_local = 0.0
-        max_charge = MAX_CHARGE_PER_SESSION_KWH  # 每轮最大充电量
+        max_move_energy = max(
+            (MAX_MOVE_PER_STEP / 1000.0) * POWER_UNIT,
+            1e-8,
+        )
+        service_kwh = max(float(event.get('service_kwh', 0.0)), 0.0)
+        recharged_kwh = max(float(event.get('recharged_kwh', 0.0)), 0.0)
+        movement_energy = max(float(event.get('movement_energy_kwh', 0.0)), 0.0)
 
-        # ── 1. quasi / iev 吸引力 ──
-        for ev in mcs.near_quasi + mcs.near_iev:
-            if ev.fail_charge or ev.is_normal:
-                continue
-            dist_km = euclidean_distance(mcs.pos[0], mcs.pos[1], ev.pos[0], ev.pos[1]) / 1000.0
-            if dist_km < 1e-6:
-                dist_km = 1e-6
+        previous_remain = float(event.get('previous_remain_kwh', mcs.remain))
+        current_remain = float(event.get('current_remain_kwh', mcs.remain))
+        threshold = max(float(MCS_RECHARGE_THRESHOLD), 1e-8)
+        previous_risk = float(np.clip((threshold - previous_remain) / threshold, 0.0, 1.0))
+        current_risk = float(np.clip((threshold - current_remain) / threshold, 0.0, 1.0))
 
-            can_serve = min(ev.need_power, max_charge) <= mcs.remain
-
-            # 紧急度: 电量越低越紧急
-            urgent = 1.0 + max(0.0, 1.0 - ev.remain / 30.0)
-            urgent = float(np.clip(urgent, 1.0, 2.0))
-            need_ratio = min(ev.need_power, max_charge) / max(1.0, max_charge)
-            attract = urgent * (1.0 + 0.2 * need_ratio)
-
-            if can_serve:
-                r_local += attract / (dist_km + 1.0)
-
-            # ── 竞争惩罚: 附近其他 idle MCS ──
-            for other in getattr(ev, 'near_idle_mcs', []):
-                if other is not mcs and other.remain >= min(ev.need_power, max_charge):
-                    dist_ij = euclidean_distance(mcs.pos[0], mcs.pos[1], other.pos[0], other.pos[1]) / 1000.0
-                    if dist_ij < 1e-6:
-                        dist_ij = 1e-6
-                    r_local -= 0.5 * (other.remain / MCS_BATTERY_CAPACITY) / (dist_ij + 1.0)
-
-            # ── 竞争惩罚: 附近 task MCS ──
-            for other in getattr(ev, 'near_task_mcs', []):
-                if other is not mcs:
-                    remain_after = other.remain - other.charge_power_kwh
-                    if remain_after >= min(ev.need_power, max_charge) and other.charge_time_remain_min <= 5:
-                        dist_ij = euclidean_distance(mcs.pos[0], mcs.pos[1], other.pos[0], other.pos[1]) / 1000.0
-                        if dist_ij < 1e-6:
-                            dist_ij = 1e-6
-                        r_local -= 0.5 * (remain_after / MCS_BATTERY_CAPACITY) / (dist_ij + 1.0)
-
-        # ── 2. 移动开销惩罚 ──
-        if mcs.last_pos is not None:
-            last_dist_km = euclidean_distance(
-                mcs.last_pos[0], mcs.last_pos[1], mcs.pos[0], mcs.pos[1]) / 1000.0
-            move_energy = last_dist_km * POWER_UNIT
-            r_local -= 1.5 * (move_energy / max(1.0, max_charge))
-
-        # ── 3. 空闲惩罚 / 无候选补偿 ──
-        if len(mcs.near_quasi) == 0 and len(mcs.near_iev) == 0:
-            r_local -= 0.05
-
-        # ── 4. 低电量惩罚 ──
-        if mcs.remain < MCS_RECHARGE_THRESHOLD:
-            r_local -= 0.3 * (1.0 - mcs.remain / max(1.0, MCS_RECHARGE_THRESHOLD))
-
-        # ── 5. 附近失败 IEV 惩罚 ──
-        nearby_fail = 0
-        for ev in mcs.near_iev:
-            if ev.fail_charge:
-                nearby_fail += 1
-        if nearby_fail > 0:
-            r_local -= 0.5 * nearby_fail
-
-        # ── 6. Credit Assignment: 成功接单 ──
-        if not mcs.is_idle and mcs.current_target is not None and mcs.is_task:
-            charge_ratio = min(mcs.charge_power_kwh, max_charge) / max(1.0, max_charge)
-            r_local += 1.0 * charge_ratio
-
-        # ── 7. 全局奖励 ──
-        r_global = 0.0
-        if not mcs.is_idle and mcs.is_task:
-            total = self.step_success_count + self.step_fail_count + 1
-            r_global += self.step_success_count / total
-            r_global += min(mcs.charge_power_kwh, max_charge) / max(1.0, max_charge)
-
-        # ── 混合 ──
-        reward = self.global_weight * r_global + self.local_weight * np.tanh(r_local * self.local_scale)
-        return float(reward)
+        components = {
+            'service': service_kwh / max(MAX_CHARGE_PER_SESSION_KWH, 1e-8),
+            'recharge': recharged_kwh / max(MAX_RECHARGE_PER_SESSION_KWH, 1e-8),
+            'movement': -0.10 * movement_energy / max_move_energy,
+            'wait': -0.02 if event.get('waited', False) else 0.0,
+            'recharge_match_failure': (
+                -0.05
+                if event.get('requested_mode') == 'Recharge'
+                and not event.get('recharge_matched', False)
+                else 0.0
+            ),
+            'broken': -2.0 if event.get('newly_broken', False) else 0.0,
+            'battery_potential': 0.20 * (previous_risk - current_risk),
+        }
+        components['total'] = float(sum(components.values()))
+        return {name: float(value) for name, value in components.items()}
 
     # ============================================================
     # IEV 奖励

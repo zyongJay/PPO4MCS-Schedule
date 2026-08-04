@@ -34,6 +34,7 @@ from config import (
 from core import EV, MCS, euclidean_distance
 from environment import MultiAgentEnv
 from matching import RechargeMatcher
+from observation import MCS_HIGH_FEATURE_NAMES
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR.parent / "results"
@@ -323,7 +324,9 @@ if __name__ == "__main__":
         # 3.2 记录每辆 MCS 的位置、电量、任务、运营指标和当前观测。
         for mcs in env.world.MCSs:
             observation = current_obs_by_agent.get(mcs, {})
-            reward = latest_reward_by_agent.get(mcs, 0.0)
+            reward_components = env.world.last_mcs_reward_components.get(mcs.id, {})
+            reward = reward_components.get('total', 0.0)
+            event = env.world.mcs_step_events.get(mcs.id, {})
             last_action = latest_action_by_agent.get(mcs, {})
 
             previous_remain = float(mcs.remain)
@@ -366,7 +369,28 @@ if __name__ == "__main__":
                 "action_target_longitude": last_action.get("target_pos", [None, None])[0],
                 "action_target_latitude": last_action.get("target_pos", [None, None])[1],
                 "reward": float(reward),
+                "reward_service": float(reward_components.get("service", 0.0)),
+                "reward_recharge": float(reward_components.get("recharge", 0.0)),
+                "reward_movement": float(reward_components.get("movement", 0.0)),
+                "reward_wait": float(reward_components.get("wait", 0.0)),
+                "reward_recharge_match_failure": float(
+                    reward_components.get("recharge_match_failure", 0.0)
+                ),
+                "reward_broken": float(reward_components.get("broken", 0.0)),
+                "reward_battery_potential": float(
+                    reward_components.get("battery_potential", 0.0)
+                ),
                 "total_reward": float(mcs.total_reward),
+                "event_mode": event.get("mode", ""),
+                "event_requested_mode": event.get("requested_mode", ""),
+                "event_recharge_matched": bool(event.get("recharge_matched", False)),
+                "event_waited": bool(event.get("waited", False)),
+                "event_movement_energy_kwh": float(
+                    event.get("movement_energy_kwh", 0.0)
+                ),
+                "event_service_kwh": float(event.get("service_kwh", 0.0)),
+                "event_recharged_kwh": float(event.get("recharged_kwh", 0.0)),
+                "event_newly_broken": bool(event.get("newly_broken", False)),
                 "is_idle": mcs.is_idle,
                 "is_task": mcs.is_task,
                 "is_recharging": mcs.is_recharging,
@@ -399,7 +423,39 @@ if __name__ == "__main__":
                     to_printable(observation.get("mask", [])),
                     ensure_ascii=False,
                 ),
+                "high_state": json.dumps(
+                    to_printable(observation.get("high_state", [])),
+                    ensure_ascii=False,
+                ),
+                "high_action_mask": json.dumps(
+                    to_printable(observation.get("high_action_mask", [])),
+                    ensure_ascii=False,
+                ),
+                "low_self_state": json.dumps(
+                    to_printable(observation.get("low_self_state", [])),
+                    ensure_ascii=False,
+                ),
+                "low_candidates": json.dumps(
+                    to_printable(observation.get("low_candidates", [])),
+                    ensure_ascii=False,
+                ),
+                "low_candidate_mask": json.dumps(
+                    to_printable(observation.get("low_candidate_mask", [])),
+                    ensure_ascii=False,
+                ),
+                "candidate_ids": json.dumps(
+                    to_printable(observation.get("candidate_ids", [])),
+                    ensure_ascii=False,
+                ),
             }
+            high_state = observation.get("high_state", [])
+            for feature_index, feature_name in enumerate(MCS_HIGH_FEATURE_NAMES):
+                value = high_state[feature_index] if feature_index < len(high_state) else None
+                mcs_row[f"high_{feature_name}"] = value
+            high_mask = observation.get("high_action_mask", [])
+            for action_index, action_name in enumerate(("serve", "recharge", "wait")):
+                value = high_mask[action_index] if action_index < len(high_mask) else None
+                mcs_row[f"mask_{action_name}_valid"] = value
             mcs_history[mcs.id].append(mcs_row)
 
         frames.append(capture_frame(env))
@@ -419,12 +475,18 @@ if __name__ == "__main__":
                 continue
             if agent.remain >= MCS_RECHARGE_THRESHOLD:
                 continue
+            observation = current_obs_by_agent.get(agent, {})
+            high_mask = observation.get("high_action_mask", [])
+            recharge_valid = len(high_mask) > 1 and bool(high_mask[1])
+            if not recharge_valid:
+                continue
             recharge_mcss.append(agent)
 
         recharge_results = recharge_matcher.match_all(
             recharge_mcss,
             env.world.FCSs,
         )
+        recharge_request_mcs_ids = {mcs.id for mcs in recharge_mcss}
         recharging_mcs_ids = set()
         for result in recharge_results:
             if result.get("success"):
@@ -455,7 +517,22 @@ if __name__ == "__main__":
                 action_n.append(
                     {
                         "mode": "Recharge",
+                        "requested_mode": "Recharge",
+                        "recharge_matched": True,
                         "target_pos": list(agent.current_target_pos),
+                    }
+                )
+                continue
+
+            if agent.id in recharge_request_mcs_ids:
+                # A valid request may still lose slot competition.  Its actual
+                # physical outcome for this step is Wait; retry next step.
+                action_n.append(
+                    {
+                        "mode": "Wait",
+                        "requested_mode": "Recharge",
+                        "recharge_matched": False,
+                        "target_pos": list(agent.pos),
                     }
                 )
                 continue
@@ -472,18 +549,23 @@ if __name__ == "__main__":
                     float(target_ev.pos[0]),
                     float(target_ev.pos[1]),
                 ]
+                action_n.append(
+                    {
+                        "mode": "Serve",
+                        "requested_mode": "Serve",
+                        "recharge_matched": False,
+                        "target_pos": target_position,
+                    }
+                )
             else:
-                target_position = [
-                    float(agent.pos[0]),
-                    float(agent.pos[1]),
-                ]
-
-            action_n.append(
-                {
-                    "mode": "Serve",
-                    "target_pos": target_position,
-                }
-            )
+                action_n.append(
+                    {
+                        "mode": "Wait",
+                        "requested_mode": "Wait",
+                        "recharge_matched": False,
+                        "target_pos": list(agent.pos),
+                    }
+                )
 
         # 每个 agent 必须有且仅有一个同位置索引的动作。
         if len(action_n) != len(acting_agents):

@@ -55,6 +55,9 @@ class World:
                               np.random.uniform(AREA_LAT_MIN, AREA_LAT_MAX, NUM_FCS)]
 
         self.current_step = 0
+        self.mcs_step_events: Dict[int, Dict] = {}
+        self.last_mcs_reward_components: Dict[int, Dict[str, float]] = {}
+        self.last_immediate_results: List[Dict] = []
         self.init_world()
 
     # ============================================================
@@ -96,7 +99,7 @@ class World:
             # 插值修复轨迹
             for i in range(len(tracks)):
                 if i < len(tracks) - 1:
-                    cur_track, nxt_track = tracks[i], tracks[i+1]
+                    cur_track, nxt_track = tracks[i], tracks[i + 1]
                     x1, y1 = cur_track.split(' ')
                     x2, y2 = nxt_track.split(' ')
                     x1, y1 = float(x1), float(y1)
@@ -106,10 +109,10 @@ class World:
                     if interval_km > COMM_RANGE:
                         itv_left = interval_km
                         while itv_left > COMM_RANGE:
-                            ratio = (COMM_RANGE - 0.001) / itv_left     # 由于使用的球面距离计算，故而增加 1米 误差
+                            ratio = (COMM_RANGE - 0.001) / itv_left  # 由于使用的球面距离计算，故而增加 1米 误差
                             x_ = x1 + ratio * (x2 - x1)
                             y_ = y1 + ratio * (y2 - y1)
-                            ev.track.append([float(x_), float(y_)])     # 插入新点
+                            ev.track.append([float(x_), float(y_)])  # 插入新点
                             x1, y1 = x_, y_
                             itv_left -= (COMM_RANGE - 0.001)
                 else:
@@ -127,6 +130,9 @@ class World:
         self.agents.clear()
         self.last_agents.clear()
         self.current_step = 0
+        self.mcs_step_events.clear()
+        self.last_mcs_reward_components.clear()
+        self.last_immediate_results.clear()
 
         random.seed(self.seed_val)
         np.random.seed(self.seed_val)
@@ -157,12 +163,12 @@ class World:
 
     def init_world_mini(self):
         """初始化一个用于验证模型训练的小场景"""
-        ev1 = EV(1, [2000, 0], 20, 100)     # quasi
-        ev2 = EV(2, [0, 2000], 25, 100)     # quasi
-        ev3 = EV(3, [0, 4000], 5, 100)      # IEV
-        mcs1 = MCS(1, [0, 0])                                        # idle
-        mcs2 = MCS(2, [4000, 0], remain_kwh=60)                      # idle
-        fcs1 = FCS(1, [3000, 1000])                                   # avail
+        ev1 = EV(1, [2000, 0], 20, 100)  # quasi
+        ev2 = EV(2, [0, 2000], 25, 100)  # quasi
+        ev3 = EV(3, [0, 4000], 5, 100)  # IEV
+        mcs1 = MCS(1, [0, 0])  # idle
+        mcs2 = MCS(2, [4000, 0], remain_kwh=60)  # idle
+        fcs1 = FCS(1, [3000, 1000])  # avail
         self.EVs.append(ev1)
         self.EVs.append(ev2)
         self.EVs.append(ev3)
@@ -175,92 +181,146 @@ class World:
     # ============================================================
 
     def update(self, action_n: List[dict]):
-        """
-        仿真环境层 action_n ————只负责需要移动的agent更新
-        IEV类agent: {"target_pos":{List}}                    # IEV
-        MCS类agent: {"mode":{Str}, "target_pos":{List}}      # idle MCS(t) -> Recharge MCS(t+1)
-        """
+        """Execute actions and record one auditable event for every MCS."""
+        previous_mcs_state = {}
+        for mcs in self.MCSs:
+            previous_mcs_state[mcs.id] = {
+                'remain': float(mcs.remain),
+                'pos': list(mcs.pos),
+                'is_broken': bool(mcs.is_broken),
+                'is_idle': bool(mcs.is_idle),
+                'is_task': bool(mcs.is_task),
+                'is_recharging': bool(mcs.is_recharging),
+            }
 
-        # ── 1a. Agent 移动: 仅使用 action_n 中的目标坐标 ──
-        for i, agent in enumerate(self.agents):
-            if i >= len(action_n):
+        action_by_mcs_id = {}
+        for index, agent in enumerate(self.agents):
+            if index >= len(action_n):
                 continue
-            act = action_n[i]
+            action = action_n[index]
             agent.last_pos = list(agent.pos)
-            mode = act.get('mode') if isinstance(agent, MCS) else None
-            target_pos = act.get('target_pos')
+            target_pos = action.get('target_pos')
             if target_pos is None:
                 continue
 
-            dist_km = euclidean_distance(agent.pos[0], agent.pos[1], target_pos[0], target_pos[1]) / 1000.0
+            dist_km = euclidean_distance(
+                agent.pos[0], agent.pos[1], target_pos[0], target_pos[1]
+            ) / 1000.0
             if isinstance(agent, EV):
-                # IEV 的 action 默认指向轨迹中的下一个点。轨迹游标、位置、
-                # 电量和状态必须全部在 World.update() 中统一更新。
                 if agent.track_index < len(agent.track) - 1:
                     next_track_pos = agent.track[agent.track_index + 1]
-                    if np.allclose(
-                        target_pos,
-                        next_track_pos,
-                        rtol=0.0,
-                        atol=1e-10,
-                    ):
+                    if np.allclose(target_pos, next_track_pos, rtol=0.0, atol=1e-10):
                         agent.track_index += 1
-
                 agent.pos = list(target_pos)
                 agent.remain -= dist_km * POWER_UNIT
                 agent.set_charge()
-
-                # 统计指标更新
                 agent.total_wait_time_min += STEP_DURATION_MIN
                 agent.total_extra_dist_km += dist_km
-            elif isinstance(agent, MCS):
-                if mode == "Recharge":
-                    # 在update函数之外已经完成 MCS-FCS 的补电绑定
-                    continue
-                elif mode == "Serve":
-                    agent.pos = target_pos
-                    agent.remain -= dist_km * POWER_UNIT
-                    if agent.remain < 0.0:
-                        agent.remain = 0.0
-                        agent.is_broken = True  # 标记MCS抛锚
-                        agent.is_idle = False
-                    # 统计指标更新
-                    agent.total_energy_consumed += dist_km * POWER_UNIT
-                    agent.total_cost += dist_km * POWER_UNIT * RC_PRICE
+                continue
 
-        # ── 1b. TASK MCS 充电推进 IEV-MCS 充电 ──
-        # RECHARGE MCS 由 FCS.advance_charging() 处理, 此处跳过
+            if not isinstance(agent, MCS):
+                continue
+
+            mode = action.get('mode', 'Wait')
+            action_by_mcs_id[agent.id] = {
+                'mode': mode,
+                'requested_mode': action.get('requested_mode', mode),
+                'recharge_matched': bool(action.get('recharge_matched', False)),
+            }
+            if mode == 'Recharge':
+                continue
+            if mode == 'Wait':
+                continue
+            if mode != 'Serve':
+                raise ValueError(f'Unsupported MCS action mode: {mode}')
+
+            required_energy = dist_km * POWER_UNIT
+            available_energy = max(float(agent.remain), 0.0)
+            if required_energy <= 1e-12:
+                agent.pos = list(target_pos)
+            elif available_energy <= required_energy:
+                ratio = available_energy / required_energy
+                agent.pos[0] += ratio * (target_pos[0] - agent.pos[0])
+                agent.pos[1] += ratio * (target_pos[1] - agent.pos[1])
+                agent.remain = 0.0
+                agent.is_broken = True
+                agent.is_idle = False
+                agent.total_energy_consumed += available_energy
+                agent.total_cost += available_energy * RC_PRICE
+            else:
+                agent.pos = list(target_pos)
+                agent.remain -= required_energy
+                agent.total_energy_consumed += required_energy
+                agent.total_cost += required_energy * RC_PRICE
+
         for mcs in self.MCSs:
-            if mcs.is_idle is False and mcs.is_recharging is False and mcs.is_broken is False and mcs.current_target is not None:
+            if (
+                not mcs.is_idle
+                and not mcs.is_recharging
+                and not mcs.is_broken
+                and mcs.current_target is not None
+            ):
                 mcs.advance_charging()
 
-        # ── 1c. FCS 充电推进 IEV-FCS & MCS-FCS ──
         for fcs in self.FCSs:
-            if fcs.is_idle is False:
+            if not fcs.is_idle:
                 fcs.advance_charging()
 
-        # ── 1d. 其他 EV 的更新 ──
         for ev in self.EVs:
-            if ev.is_charged or ev.fail_charge:
+            if ev.is_charged or ev.fail_charge or ev.is_normal:
                 continue
-            if ev.is_normal or ev.fail_charge:
-                continue
-            elif (ev.is_charged and ev.charge_pos is None) or ev.is_quasi:
+            if (ev.is_charged and ev.charge_pos is None) or ev.is_quasi:
                 ev.last_pos = list(ev.pos)
                 if ev.track_index < len(ev.track) - 1:
                     ev.track_index += 1
                     ev.pos = list(ev.track[ev.track_index])
-                    dist_km = euclidean_distance(ev.last_pos[0], ev.last_pos[1], ev.pos[0], ev.pos[1]) / 1000.0
-                    ev.remain -= dist_km * POWER_UNIT  # dist 单位为米, 转为 km
+                    dist_km = euclidean_distance(
+                        ev.last_pos[0], ev.last_pos[1], ev.pos[0], ev.pos[1]
+                    ) / 1000.0
+                    ev.remain -= dist_km * POWER_UNIT
                     ev.set_charge()
                 else:
                     ev.arrived = True
                     ev.need_charge = False
 
+        events = {}
+        for mcs in self.MCSs:
+            previous = previous_mcs_state[mcs.id]
+            action = action_by_mcs_id.get(mcs.id, {})
+            moved_distance_km = euclidean_distance(
+                previous['pos'][0], previous['pos'][1], mcs.pos[0], mcs.pos[1]
+            ) / 1000.0
+            movement_energy = moved_distance_km * POWER_UNIT
+            battery_delta = float(mcs.remain) - previous['remain']
+            involved_in_task = previous['is_task'] or mcs.is_task
+            involved_in_recharge = previous['is_recharging'] or mcs.is_recharging
+            service_kwh = max(-battery_delta - movement_energy, 0.0) if involved_in_task else 0.0
+            recharged_kwh = max(battery_delta + movement_energy, 0.0) if involved_in_recharge else 0.0
+            default_mode = 'TaskProgress' if involved_in_task else (
+                'RechargeProgress' if involved_in_recharge else 'Inactive'
+            )
+            events[mcs.id] = {
+                'mode': action.get('mode', default_mode),
+                'requested_mode': action.get('requested_mode', default_mode),
+                'recharge_matched': bool(action.get('recharge_matched', False)),
+                'waited': action.get('mode') == 'Wait',
+                'movement_distance_km': float(moved_distance_km),
+                'movement_energy_kwh': float(movement_energy),
+                'service_kwh': float(service_kwh),
+                'recharged_kwh': float(recharged_kwh),
+                'battery_delta_kwh': float(battery_delta),
+                'previous_remain_kwh': float(previous['remain']),
+                'current_remain_kwh': float(mcs.remain),
+                'newly_broken': bool(mcs.is_broken and not previous['is_broken']),
+                'became_idle': bool(mcs.is_idle and not previous['is_idle']),
+                'became_task': bool(mcs.is_task and not previous['is_task']),
+                'became_recharging': bool(mcs.is_recharging and not previous['is_recharging']),
+            }
+        self.mcs_step_events = events
         self.current_step += 1
 
     # ============================================================
-    # ② step_finish() — 完成 agents 迭代
+    # step_finish
     # ============================================================
 
     def step_finish(self):
@@ -280,6 +340,14 @@ class World:
     def match_and_get_neibor(self):
         # ── 即时匹配: IEV ↔ Idle MCS / Available FCS ──
         results = self.immediate_matcher.match_all(self.EVs, self.MCSs, self.FCSs)
+        self.last_immediate_results = list(results)
+        for result in results:
+            if not result.get('success') or result.get('provider_type') != 'MCS':
+                continue
+            event = self.mcs_step_events.get(result.get('provider_id'))
+            if event is not None:
+                event['became_task'] = True
+                event['matched_iev_id'] = result.get('ev_id', -1)
         if self.verbose:
             print(f'step{self.current_step}充电匹配阶段内：\n')
             for rst in results:
@@ -433,10 +501,21 @@ class World:
                 done_n.append(True)
                 # 特征置空
                 if isinstance(agent, MCS):
+                    low_candidates = np.zeros(
+                        (TOP_K_MCS_CANDIDATES, MCS_FEAT_DIM_tgt), dtype=np.float32
+                    )
+                    low_candidate_mask = np.zeros(TOP_K_MCS_CANDIDATES, dtype=bool)
+                    low_self_state = np.zeros(MCS_FEAT_DIM_self, dtype=np.float32)
                     old_obs_n.append({
-                        'obs_self': np.zeros(MCS_FEAT_DIM_self, dtype=np.float32),
-                        'obs_tgt': np.zeros((TOP_K_MCS_CANDIDATES, MCS_FEAT_DIM_tgt), dtype=np.float32),
-                        'mask': np.zeros(TOP_K_MCS_CANDIDATES, dtype=bool),
+                        'high_state': np.zeros(MCS_HIGH_FEAT_DIM, dtype=np.float32),
+                        'high_action_mask': np.asarray([False, False, True], dtype=bool),
+                        'low_self_state': low_self_state,
+                        'low_candidates': low_candidates,
+                        'low_candidate_mask': low_candidate_mask,
+                        'candidate_ids': np.full(TOP_K_MCS_CANDIDATES, -1, dtype=np.int64),
+                        'obs_self': low_self_state,
+                        'obs_tgt': low_candidates,
+                        'mask': np.logical_not(low_candidate_mask),
                         'done': True,
                     })
                 else:
@@ -454,15 +533,22 @@ class World:
     # ============================================================
 
     def mix_get_reward_n(self):
-        """为 last_agents 计算奖励, 返回奖励列表 (与 last_agents 对齐)"""
+        """Return rewards aligned with last_agents and retain all MCS details."""
+        self.last_mcs_reward_components = {}
+        for mcs in self.MCSs:
+            event = self.mcs_step_events.get(mcs.id, {})
+            components = self.reward_builder.compute_mcs_reward(mcs, event)
+            self.last_mcs_reward_components[mcs.id] = components
+            mcs.total_reward += components['total']
+
         reward_n = []
         for agent in self.last_agents:
             if isinstance(agent, MCS):
-                r = self.reward_builder.compute_mcs_reward(agent, {})
+                reward = self.last_mcs_reward_components[agent.id]['total']
             else:
-                r = self.reward_builder.compute_iev_reward(agent, {})
-            agent.total_reward += r
-            reward_n.append(r)
+                reward = self.reward_builder.compute_iev_reward(agent, {})
+                agent.total_reward += reward
+            reward_n.append(float(reward))
         return reward_n
 
     # ============================================================

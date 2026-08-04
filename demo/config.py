@@ -25,8 +25,8 @@ AREA_LAT_MAX = 30.7309
 # ============================
 # 2. 实体数量
 # ============================
-NUM_EV = 500
-NUM_MCS = 20
+NUM_EV = 300
+NUM_MCS = 10
 NUM_FCS = 5
 FCS_SLOTS_PER_STATION = 3
 
@@ -90,6 +90,7 @@ W_MOVE = 1.0
 
 MCS_FEAT_DIM_tgt = 5
 MCS_FEAT_DIM_self = 3
+MCS_HIGH_FEAT_DIM = 7
 EV_FEAT_DIM_tgt = 6
 EV_FEAT_DIM_self = 6
 FCS_FEAT_DIM = 7
