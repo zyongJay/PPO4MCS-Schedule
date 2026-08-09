@@ -1,7 +1,7 @@
 import enum
 import math
-import time
 from typing import List, Tuple, Optional, Union
+
 from config import *
 
 
@@ -207,10 +207,10 @@ class EV:
     # 充电任务结束后重置    交给充电方MCS / FCS 具体实现
     def finish_charging(self):
         """充电结束 → 转入 SUCCESS 状态, 后续沿轨迹移动至终点。"""
-        self.charge_provider = None
-        self.charge_provider_type = ""
-        self.charge_provider_id = -1
-        self.charge_pos = None
+        # self.charge_provider = None
+        # self.charge_provider_type = ""
+        # self.charge_provider_id = -1
+        # self.charge_pos = None
         self.waiting_target_id = -1
         self.waiting_target_type = ""
         self.waiting_target_pos = None
@@ -340,6 +340,8 @@ class MCS:
         self.total_profit = 0.0  # 给IEV充电的净利润
         self.total_reward = 0.0
         self.total_idle_time_min = 0.0
+        # 连续主动 Wait 的环境 step 数；forced Wait 不累计。
+        self.consecutive_voluntary_wait_steps = 0
 
     # 注入任务信息    MCS-IEV充电 / MCS-FCS补电共用
     def set_target(self, obj, target_type: str, target_id: int,
@@ -439,6 +441,7 @@ class MCS:
         self.remain = remain_kwh
         self.is_idle = True
         self.is_recharging = False
+        self.is_broken = False
         self.last_pos = list(pos)
         self.reward = 0
 
@@ -468,6 +471,7 @@ class MCS:
         self.total_profit = 0.0  # 给IEV充电的毛利润
         self.total_reward = 0.0
         self.total_idle_time_min = 0.0
+        self.consecutive_voluntary_wait_steps = 0
 
     def step_finish(self):
         self.last_pos = self.pos
@@ -499,7 +503,7 @@ class FCS:
         self.slot_charge_remain_min: List[float] = [0.0] * num_slots
 
         # 统计指标
-        self.total_idle_time = 0.0
+        self.total_idle_time_min = 0.0
         self.total_charged_kwh = 0.0  # 为IEV充电 和 为MCS补电的总电量
         self.total_profit = 0.0  # 为IEV充电 和 为MCS补电 的净利润
         self.total_cost = 0.0  # 充电成本
@@ -624,7 +628,7 @@ class FCS:
             self.slot_charge_remain_kwh[i] = 0.0
             self.slot_charge_remain_min[i] = 0.0
 
-        self.total_idle_time = 0.0
+        self.total_idle_time_min = 0.0
         self.total_charged_kwh = 0.0
         self.total_profit = 0.0
 

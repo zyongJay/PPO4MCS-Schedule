@@ -37,7 +37,7 @@ from matching import RechargeMatcher
 from observation import MCS_HIGH_FEATURE_NAMES
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR.parent / "results"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR.parent / "simulation_results"
 
 # config.py 中的轨迹路径以 demo 目录为基准。转换为绝对路径后，
 # 从项目根目录或 demo 目录运行本脚本都能正确读取轨迹数据。

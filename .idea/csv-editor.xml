@@ -31,49 +31,28 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="\results\ev_1_history.csv">
+        <entry key="\evaluation_results_v5\evaluation_scenarios.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\results\mcs_16_history.csv">
+        <entry key="\evaluation_results_v5\evaluation_summary.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\results\mcs_17_history.csv">
+        <entry key="\test_results\evaluation_scenarios.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
             </Attribute>
           </value>
         </entry>
-        <entry key="\results\mcs_1_history.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\results\mcs_2_history.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\results\mcs_6_history.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\results\simulation_statistics.csv">
+        <entry key="\test_results\evaluation_summary.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
@@ -88,6 +67,34 @@
           </value>
         </entry>
         <entry key="\training_results\training_log.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\training_results_v2\training_log.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\training_results_v3\training_log.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\training_results_v4\training_log.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\training_results_v5\training_log.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />

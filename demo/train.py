@@ -274,6 +274,14 @@ def collect_episode(
     episode_buffer = OptionAwareRolloutBuffer(args.gamma, args.gae_lambda)
     episode_reward = 0.0
     reward_component_names = (
+        'system_success',
+        'system_failure',
+        'attributed_mcs_success',
+        'controllable_failure',
+        'uncontrollable_failure',
+        'fcs_success_kpi',
+        'attributed_mcs_success_weight',
+        'controllable_failure_weight',
         'service',
         'serve_attraction',
         'serve_competition',
@@ -281,6 +289,10 @@ def collect_episode(
         'recharge',
         'movement',
         'wait',
+        'wait_base',
+        'wait_opportunity',
+        'wait_streak',
+        'wait_forced_time',
         'recharge_match_failure',
         'broken',
         'battery_potential',
@@ -291,6 +303,17 @@ def collect_episode(
     action_counts = {'Serve': 0, 'Recharge': 0, 'Wait': 0}
     recharge_request_count = 0
     recharge_match_count = 0
+    event_audit_totals = {
+        'attributed_mcs_success_count': 0,
+        'attributed_mcs_success_weight_sum': 0.0,
+        'controllable_failure_weight_sum': 0.0,
+        'controllable_failure_count': 0,
+        'uncontrollable_failure_count': 0,
+        'fcs_success_kpi_count': 0,
+        'unattributed_mcs_success_count': 0,
+        'forced_wait_count': 0,
+        'voluntary_wait_count': 0,
+    }
     executed_steps = 0
     ev_by_id = {ev.id: ev for ev in env.world.EVs}
 
@@ -372,6 +395,9 @@ def collect_episode(
                         'mode': 'Recharge',
                         'requested_mode': 'Recharge',
                         'recharge_matched': True,
+                        'high_action_mask': observation[
+                            'high_action_mask'
+                        ].tolist(),
                         'target_pos': list(actor.current_target_pos),
                     })
                 else:
@@ -379,6 +405,9 @@ def collect_episode(
                         'mode': 'Wait',
                         'requested_mode': 'Recharge',
                         'recharge_matched': False,
+                        'high_action_mask': observation[
+                            'high_action_mask'
+                        ].tolist(),
                         'target_pos': list(actor.pos),
                     })
             elif action['mode'] == 'Wait':
@@ -386,6 +415,9 @@ def collect_episode(
                     'mode': 'Wait',
                     'requested_mode': 'Wait',
                     'recharge_matched': False,
+                    'high_action_mask': observation[
+                        'high_action_mask'
+                    ].tolist(),
                     'target_pos': list(actor.pos),
                 })
             else:
@@ -398,6 +430,9 @@ def collect_episode(
                     'mode': 'Serve',
                     'requested_mode': 'Serve',
                     'recharge_matched': False,
+                    'high_action_mask': observation[
+                        'high_action_mask'
+                    ].tolist(),
                     'target_pos': list(target.pos),
                 })
 
@@ -413,6 +448,10 @@ def collect_episode(
                 reward_component_sums[name] += float(
                     components.get(name, 0.0)
                 )
+        for name in event_audit_totals:
+            event_audit_totals[name] += env.world.last_system_reward_event.get(
+                name, 0
+            )
         episode_buffer.add_step_rewards(reward_by_mcs)
 
         next_agents = list(env.world.agents)
@@ -456,9 +495,23 @@ def collect_episode(
 
     episode_buffer.compute_returns_and_advantages()
     successes = sum(
-        ev.is_charged and ev.charge_pos is None for ev in env.world.EVs
+        ev.is_charged for ev in env.world.EVs
+    )
+    mcs_successes = sum(
+        ev.is_charged and ev.charge_provider_type == 'MCS'
+        for ev in env.world.EVs
+    )
+    fcs_successes = sum(
+        ev.is_charged and ev.charge_provider_type == 'FCS'
+        for ev in env.world.EVs
     )
     failures = sum(ev.fail_charge for ev in env.world.EVs)
+    # 仅记录终止时仍存在的未完成充电需求。其业务归类尚不明确，因此不
+    # 擅自改写为 fail，也不在本版本追加终止责任惩罚。
+    unresolved_count = sum(
+        ev.need_charge and not ev.is_charged and not ev.fail_charge
+        for ev in env.world.EVs
+    )
     finished = successes + failures
     success_rate = successes / finished if finished else 0.0
     mcs_count = max(len(env.world.MCSs), 1)
@@ -497,7 +550,35 @@ def collect_episode(
         'avg_reward': episode_reward / reward_denominator,
         'charge_success_rate': success_rate,
         'charge_success_count': successes,
+        'charge_success_mcs_count': mcs_successes,
+        'charge_success_fcs_count': fcs_successes,
         'charge_failure_count': failures,
+        'unresolved_count': unresolved_count,
+        'attributed_mcs_success_count': int(
+            event_audit_totals['attributed_mcs_success_count']
+        ),
+        'attributed_mcs_success_weight_sum': float(
+            event_audit_totals['attributed_mcs_success_weight_sum']
+        ),
+        'controllable_failure_count': int(
+            event_audit_totals['controllable_failure_count']
+        ),
+        'uncontrollable_failure_count': int(
+            event_audit_totals['uncontrollable_failure_count']
+        ),
+        'controllable_failure_weight_sum': float(
+            event_audit_totals['controllable_failure_weight_sum']
+        ),
+        'fcs_success_kpi_count': int(
+            event_audit_totals['fcs_success_kpi_count']
+        ),
+        'unattributed_mcs_success_count': int(
+            event_audit_totals['unattributed_mcs_success_count']
+        ),
+        'forced_wait_count': int(event_audit_totals['forced_wait_count']),
+        'voluntary_wait_count': int(
+            event_audit_totals['voluntary_wait_count']
+        ),
         'total_mcs_profit': total_mcs_profit,
         'avg_mcs_profit': total_mcs_profit / mcs_count,
         'total_mcs_cost': total_mcs_cost,

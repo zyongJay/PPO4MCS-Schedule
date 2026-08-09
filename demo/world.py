@@ -12,7 +12,6 @@ demo/world.py — 仿真世界实现 (Target-based Replanning 架构)
 """
 
 import random
-import time
 from typing import Dict, List
 
 import numpy as np
@@ -58,6 +57,11 @@ class World:
         self.mcs_step_events: Dict[int, Dict] = {}
         self.last_mcs_reward_components: Dict[int, Dict[str, float]] = {}
         self.last_immediate_results: List[Dict] = []
+        # 保存当前step动作执行前的EV结果状态，用于识别系统级新增成功/失败。
+        self.ev_outcomes_before_step: Dict[int, tuple[bool, bool]] = {}
+        self.last_system_reward_event: Dict[str, float] = {}
+        # 新失败在下一轮匹配前计算责任，避免用匹配后的资源状态回溯责任。
+        self.pending_failure_responsibilities: Dict[int, Dict[int, float]] = {}
         self.init_world()
 
     # ============================================================
@@ -133,6 +137,9 @@ class World:
         self.mcs_step_events.clear()
         self.last_mcs_reward_components.clear()
         self.last_immediate_results.clear()
+        self.ev_outcomes_before_step.clear()
+        self.last_system_reward_event.clear()
+        self.pending_failure_responsibilities.clear()
 
         random.seed(self.seed_val)
         np.random.seed(self.seed_val)
@@ -182,16 +189,36 @@ class World:
 
     def update(self, action_n: List[dict]):
         """Execute actions and record one auditable event for every MCS."""
+        # reset阶段的自动匹配发生在任何策略动作之前。每个正式step在
+        # 动作执行前记录结果状态，随后只奖励本step新发生的成功/失败，
+        # 从而避免初始匹配或历史结果被重复计奖。
+        self.ev_outcomes_before_step = {
+            ev.id: (bool(ev.is_charged), bool(ev.fail_charge))
+            for ev in self.EVs
+        }
+
+        # FCS 只有在所有充电槽均空闲时，is_idle 才为 True。
+        # 按完整 step 统计该状态的持续时间，单位为分钟。
+        for fcs in self.FCSs:
+            if fcs.is_idle:
+                fcs.total_idle_time_min += STEP_DURATION_MIN
+
         previous_mcs_state = {}
         for mcs in self.MCSs:
             spatial = self.reward_builder.compute_mcs_spatial_features(
                 mcs, self.EVs, self.MCSs, self.FCSs
+            )
+            best_serve_potential = (
+                self.reward_builder.compute_best_available_serve_potential(
+                    mcs, self.MCSs, self.FCSs
+                )
             )
             previous_mcs_state[mcs.id] = {
                 'remain': float(mcs.remain),
                 'spatial_attraction': spatial['attraction'],
                 'spatial_competition': spatial['competition'],
                 'spatial_potential': spatial['potential'],
+                'best_serve_potential': best_serve_potential,
                 'pos': list(mcs.pos),
                 'is_broken': bool(mcs.is_broken),
                 'is_idle': bool(mcs.is_idle),
@@ -213,25 +240,55 @@ class World:
                 agent.pos[0], agent.pos[1], target_pos[0], target_pos[1]
             ) / 1000.0
             if isinstance(agent, EV):
+                is_next_track_move = False
                 if agent.track_index < len(agent.track) - 1:
                     next_track_pos = agent.track[agent.track_index + 1]
-                    if np.allclose(target_pos, next_track_pos, rtol=0.0, atol=1e-10):
+                    is_next_track_move = bool(np.allclose(
+                        target_pos,
+                        next_track_pos,
+                        rtol=0.0,
+                        atol=1e-10,
+                    ))
+                    if is_next_track_move:
                         agent.track_index += 1
                 agent.pos = list(target_pos)
                 agent.remain -= dist_km * POWER_UNIT
                 agent.set_charge()
                 agent.total_wait_time_min += STEP_DURATION_MIN
-                agent.total_extra_dist_km += dist_km
+                if not is_next_track_move:
+                    agent.total_extra_dist_km += dist_km
                 continue
 
             if not isinstance(agent, MCS):
                 continue
 
             mode = action.get('mode', 'Wait')
+            high_action_mask = np.asarray(
+                action.get('high_action_mask', []), dtype=bool
+            ).reshape(-1)
+            if high_action_mask.size < 3:
+                # 兼容旧调用方：按动作执行前的局部状态重建有效动作掩码。
+                serve_available = any(
+                    ev.is_quasi for ev in getattr(agent, 'near_quasi', [])
+                )
+                recharge_available = any(
+                    fcs.has_available_slot()
+                    and euclidean_distance(
+                        agent.pos[0], agent.pos[1], fcs.pos[0], fcs.pos[1]
+                    ) / 1000.0 <= COMM_RANGE
+                    and agent.remain > euclidean_distance(
+                        agent.pos[0], agent.pos[1], fcs.pos[0], fcs.pos[1]
+                    ) / 1000.0 * POWER_UNIT
+                    for fcs in getattr(agent, 'near_available_fcs', [])
+                )
+                high_action_mask = np.asarray([
+                    serve_available, recharge_available, True
+                ], dtype=bool)
             action_by_mcs_id[agent.id] = {
                 'mode': mode,
                 'requested_mode': action.get('requested_mode', mode),
                 'recharge_matched': bool(action.get('recharge_matched', False)),
+                'high_action_mask': high_action_mask,
             }
             if mode == 'Recharge':
                 continue
@@ -298,24 +355,59 @@ class World:
                 and not previous['is_recharging']
             ):
                 mcs.total_idle_time_min += STEP_DURATION_MIN
+            involved_in_task = previous['is_task'] or mcs.is_task
+            involved_in_recharge = (
+                previous['is_recharging'] or mcs.is_recharging
+            )
+            default_mode = 'TaskProgress' if involved_in_task else (
+                'RechargeProgress' if involved_in_recharge else 'Inactive'
+            )
             action = action_by_mcs_id.get(mcs.id, {})
+            requested_mode = action.get('requested_mode', default_mode)
+            high_action_mask = np.asarray(
+                action.get('high_action_mask', [False, False, True]),
+                dtype=bool,
+            ).reshape(-1)
+            serve_available = bool(
+                high_action_mask[0] if high_action_mask.size > 0 else False
+            )
+            recharge_available = bool(
+                high_action_mask[1] if high_action_mask.size > 1 else False
+            )
+            selected_wait = requested_mode == 'Wait'
+            forced_wait = bool(
+                selected_wait and not serve_available and not recharge_available
+            )
+            voluntary_wait = bool(
+                selected_wait and (serve_available or recharge_available)
+            )
+            if voluntary_wait:
+                mcs.consecutive_voluntary_wait_steps += 1
+            else:
+                # Serve、Recharge、forced Wait 或任务推进均会中断主动等待串。
+                mcs.consecutive_voluntary_wait_steps = 0
+
             moved_distance_km = euclidean_distance(
                 previous['pos'][0], previous['pos'][1], mcs.pos[0], mcs.pos[1]
             ) / 1000.0
             movement_energy = moved_distance_km * POWER_UNIT
             battery_delta = float(mcs.remain) - previous['remain']
-            involved_in_task = previous['is_task'] or mcs.is_task
-            involved_in_recharge = previous['is_recharging'] or mcs.is_recharging
             service_kwh = max(-battery_delta - movement_energy, 0.0) if involved_in_task else 0.0
             recharged_kwh = max(battery_delta + movement_energy, 0.0) if involved_in_recharge else 0.0
-            default_mode = 'TaskProgress' if involved_in_task else (
-                'RechargeProgress' if involved_in_recharge else 'Inactive'
-            )
             events[mcs.id] = {
                 'mode': action.get('mode', default_mode),
-                'requested_mode': action.get('requested_mode', default_mode),
+                'requested_mode': requested_mode,
                 'recharge_matched': bool(action.get('recharge_matched', False)),
                 'waited': action.get('mode') == 'Wait',
+                'forced_wait': forced_wait,
+                'voluntary_wait': voluntary_wait,
+                'wait_duration_steps': 1 if selected_wait else 0,
+                'consecutive_voluntary_wait_steps': int(
+                    mcs.consecutive_voluntary_wait_steps
+                ),
+                'best_available_serve_potential': float(
+                    previous['best_serve_potential']
+                ),
                 'movement_distance_km': float(moved_distance_km),
                 'movement_energy_kwh': float(movement_energy),
                 'service_kwh': float(service_kwh),
@@ -332,6 +424,19 @@ class World:
                 'became_recharging': bool(mcs.is_recharging and not previous['is_recharging']),
             }
         self.mcs_step_events = events
+        # 失败责任必须使用匹配前状态。匹配后 idle MCS 可能已接到其他任务，
+        # 再回溯会把本应可控的失败错误归为外生失败。
+        self.pending_failure_responsibilities = {}
+        for ev in self.EVs:
+            previous_charged, previous_failed = self.ev_outcomes_before_step.get(
+                ev.id, (bool(ev.is_charged), bool(ev.fail_charge))
+            )
+            if ev.fail_charge and not previous_failed and not previous_charged:
+                self.pending_failure_responsibilities[ev.id] = (
+                    self.reward_builder.compute_failure_responsibility_weights(
+                        ev, self.MCSs
+                    )
+                )
         self.current_step += 1
 
     # ============================================================
@@ -549,9 +654,94 @@ class World:
 
     def mix_get_reward_n(self):
         """Return rewards aligned with last_agents and retain all MCS details."""
+        new_success_evs = []
+        new_failure_evs = []
+        for ev in self.EVs:
+            previous_charged, previous_failed = (
+                self.ev_outcomes_before_step.get(
+                    ev.id,
+                    (bool(ev.is_charged), bool(ev.fail_charge)),
+                )
+            )
+            if ev.is_charged and not previous_charged:
+                new_success_evs.append(ev)
+            if ev.fail_charge and not previous_failed:
+                new_failure_evs.append(ev)
+
+        mcs_success_count_by_id: Dict[int, int] = {
+            mcs.id: 0 for mcs in self.MCSs
+        }
+        new_mcs_success_count = 0
+        new_fcs_success_count = 0
+        unattributed_mcs_success_count = 0
+        for ev in new_success_evs:
+            if ev.charge_provider_type == 'MCS':
+                new_mcs_success_count += 1
+                if ev.charge_provider_id in mcs_success_count_by_id:
+                    mcs_success_count_by_id[ev.charge_provider_id] += 1
+                else:
+                    unattributed_mcs_success_count += 1
+            elif ev.charge_provider_type == 'FCS':
+                new_fcs_success_count += 1
+
+        failure_weight_by_mcs_id: Dict[int, float] = {
+            mcs.id: 0.0 for mcs in self.MCSs
+        }
+        controllable_failure_count = 0
+        uncontrollable_failure_count = 0
+        for ev in new_failure_evs:
+            weights = self.pending_failure_responsibilities.get(ev.id, {})
+            if weights:
+                controllable_failure_count += 1
+                for mcs_id, weight in weights.items():
+                    if mcs_id in failure_weight_by_mcs_id:
+                        failure_weight_by_mcs_id[mcs_id] += float(weight)
+            else:
+                uncontrollable_failure_count += 1
+
+        success_weight_sum = float(sum(mcs_success_count_by_id.values()))
+        failure_weight_sum = float(sum(failure_weight_by_mcs_id.values()))
+        forced_wait_count = sum(
+            bool(event.get('forced_wait', False))
+            for event in self.mcs_step_events.values()
+        )
+        voluntary_wait_count = sum(
+            bool(event.get('voluntary_wait', False))
+            for event in self.mcs_step_events.values()
+        )
+        self.last_system_reward_event = {
+            'new_success_count': len(new_success_evs),
+            'new_failure_count': len(new_failure_evs),
+            'new_mcs_success_count': new_mcs_success_count,
+            'new_fcs_success_count': new_fcs_success_count,
+            'unattributed_mcs_success_count': unattributed_mcs_success_count,
+            'attributed_mcs_success_count': int(success_weight_sum),
+            'attributed_mcs_success_weight_sum': success_weight_sum,
+            'controllable_failure_count': controllable_failure_count,
+            'uncontrollable_failure_count': uncontrollable_failure_count,
+            'controllable_failure_weight_sum': failure_weight_sum,
+            'forced_wait_count': forced_wait_count,
+            'voluntary_wait_count': voluntary_wait_count,
+        }
+
         self.last_mcs_reward_components = {}
         for mcs in self.MCSs:
             event = self.mcs_step_events.get(mcs.id, {})
+            attributed_success_count = mcs_success_count_by_id.get(mcs.id, 0)
+            event['attributed_mcs_success_count'] = attributed_success_count
+            event['attributed_mcs_success_weight'] = float(
+                attributed_success_count
+            )
+            event['controllable_failure_weight'] = float(
+                failure_weight_by_mcs_id.get(mcs.id, 0.0)
+            )
+            event['controllable_failure_count'] = (
+                controllable_failure_count
+            )
+            event['uncontrollable_failure_count'] = (
+                uncontrollable_failure_count
+            )
+            event['fcs_success_kpi_count'] = new_fcs_success_count
             post_spatial = self.reward_builder.compute_mcs_spatial_features(
                 mcs, self.EVs, self.MCSs, self.FCSs
             )
