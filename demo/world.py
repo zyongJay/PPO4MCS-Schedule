@@ -60,9 +60,42 @@ class World:
         # 保存当前step动作执行前的EV结果状态，用于识别系统级新增成功/失败。
         self.ev_outcomes_before_step: Dict[int, tuple[bool, bool]] = {}
         self.last_system_reward_event: Dict[str, float] = {}
+        # Low 奖励按唯一 Serve 决策 ID 路由，不再按当前 mcs_id 猜测。
+        self.last_low_reward_by_decision: Dict[int, float] = {}
+        self.last_low_event_records: List[Dict] = []
         # 新失败在下一轮匹配前计算责任，避免用匹配后的资源状态回溯责任。
         self.pending_failure_responsibilities: Dict[int, Dict[int, float]] = {}
         self.init_world()
+
+    def _would_mcs_be_energy_stranded(self, mcs: MCS) -> bool:
+        """判断可用MCS当前是否因电量不足而无法到达任何物理FCS。
+
+        这里只检查物理能量可达性，不把 FCS 当前无空闲槽、匹配竞争等
+        外生因素算作受困。任务中、补电中和 broken 的 MCS 也不重复记账。
+        """
+        if (
+            not self.FCSs
+            or not mcs.is_idle
+            or mcs.is_recharging
+            or mcs.is_broken
+        ):
+            return False
+        nearest_required_energy = min(
+            euclidean_distance(
+                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
+            ) / 1000.0 * POWER_UNIT
+            for fcs in self.FCSs
+        )
+        return bool(
+            float(mcs.remain) + 1e-12 < float(nearest_required_energy)
+        )
+
+    def _is_mcs_energy_stranded(self, mcs: MCS) -> bool:
+        """返回持久受困状态，兼容尚未固化状态的边界检查。"""
+        return bool(
+            getattr(mcs, 'is_energy_stranded', False)
+            or self._would_mcs_be_energy_stranded(mcs)
+        )
 
     # ============================================================
     # 初始化
@@ -139,6 +172,8 @@ class World:
         self.last_immediate_results.clear()
         self.ev_outcomes_before_step.clear()
         self.last_system_reward_event.clear()
+        self.last_low_reward_by_decision.clear()
+        self.last_low_event_records.clear()
         self.pending_failure_responsibilities.clear()
 
         random.seed(self.seed_val)
@@ -168,21 +203,6 @@ class World:
             remain = np.random.normal(loc=EV_POWER_MEAN, scale=EV_POWER_STD)
             ev.reset([float(row['lng']), float(row['lat'])], remain)
 
-    def init_world_mini(self):
-        """初始化一个用于验证模型训练的小场景"""
-        ev1 = EV(1, [2000, 0], 20, 100)  # quasi
-        ev2 = EV(2, [0, 2000], 25, 100)  # quasi
-        ev3 = EV(3, [0, 4000], 5, 100)  # IEV
-        mcs1 = MCS(1, [0, 0])  # idle
-        mcs2 = MCS(2, [4000, 0], remain_kwh=60)  # idle
-        fcs1 = FCS(1, [3000, 1000])  # avail
-        self.EVs.append(ev1)
-        self.EVs.append(ev2)
-        self.EVs.append(ev3)
-        self.MCSs.append(mcs1)
-        self.MCSs.append(mcs2)
-        self.FCSs.append(fcs1)
-
     # ============================================================
     # ① update(action_n) — 执行动作, 移动智能体, 更新环境
     # ============================================================
@@ -208,6 +228,9 @@ class World:
             spatial = self.reward_builder.compute_mcs_spatial_features(
                 mcs, self.EVs, self.MCSs, self.FCSs
             )
+            low_spatial = self.reward_builder.compute_low_spatial_features(
+                mcs, self.EVs, self.FCSs
+            )
             best_serve_potential = (
                 self.reward_builder.compute_best_available_serve_potential(
                     mcs, self.MCSs, self.FCSs
@@ -218,12 +241,23 @@ class World:
                 'spatial_attraction': spatial['attraction'],
                 'spatial_competition': spatial['competition'],
                 'spatial_potential': spatial['potential'],
+                'low_spatial_attraction': low_spatial['attraction'],
+                'low_spatial_mcs_competition': low_spatial[
+                    'mcs_competition'
+                ],
+                'low_spatial_fcs_competition': low_spatial[
+                    'fcs_competition'
+                ],
+                'low_spatial_desirability': low_spatial['desirability'],
                 'best_serve_potential': best_serve_potential,
                 'pos': list(mcs.pos),
                 'is_broken': bool(mcs.is_broken),
                 'is_idle': bool(mcs.is_idle),
                 'is_task': bool(mcs.is_task),
                 'is_recharging': bool(mcs.is_recharging),
+                'is_energy_stranded': bool(
+                    getattr(mcs, 'is_energy_stranded', False)
+                ),
             }
 
         action_by_mcs_id = {}
@@ -253,8 +287,7 @@ class World:
                         agent.track_index += 1
                 agent.pos = list(target_pos)
                 agent.remain -= dist_km * POWER_UNIT
-                agent.set_charge()
-                agent.total_wait_time_min += STEP_DURATION_MIN
+                agent.set_charge()                                  # 更新EV状态
                 if not is_next_track_move:
                     agent.total_extra_dist_km += dist_km
                 continue
@@ -266,30 +299,65 @@ class World:
             high_action_mask = np.asarray(
                 action.get('high_action_mask', []), dtype=bool
             ).reshape(-1)
-            if high_action_mask.size < 3:
+            if high_action_mask.size < 2:
                 # 兼容旧调用方：按动作执行前的局部状态重建有效动作掩码。
-                serve_available = any(
-                    ev.is_quasi for ev in getattr(agent, 'near_quasi', [])
-                )
-                recharge_available = any(
-                    fcs.has_available_slot()
-                    and euclidean_distance(
-                        agent.pos[0], agent.pos[1], fcs.pos[0], fcs.pos[1]
-                    ) / 1000.0 <= COMM_RANGE
-                    and agent.remain > euclidean_distance(
-                        agent.pos[0], agent.pos[1], fcs.pos[0], fcs.pos[1]
-                    ) / 1000.0 * POWER_UNIT
-                    for fcs in getattr(agent, 'near_available_fcs', [])
+                recharge_available = bool(
+                    self.obs_builder.get_reachable_recharge_candidates(
+                        agent, self.FCSs
+                    )
                 )
                 high_action_mask = np.asarray([
-                    serve_available, recharge_available, True
+                    True, recharge_available
                 ], dtype=bool)
+            else:
+                # 旧三动作调用方只读取前两个动作；Serve 由Low当前位置保底。
+                high_action_mask = high_action_mask[:2].copy()
+                high_action_mask[0] = True
             action_by_mcs_id[agent.id] = {
                 'mode': mode,
                 'requested_mode': action.get('requested_mode', mode),
                 'recharge_matched': bool(action.get('recharge_matched', False)),
                 'high_action_mask': high_action_mask,
+                'low_decision_id': int(action.get('low_decision_id', -1)),
+                'serve_option_id': int(action.get('serve_option_id', -1)),
+                'low_candidate_id': int(action.get('low_candidate_id', -1)),
+                'low_stay_selected': bool(
+                    action.get('low_stay_selected', False)
+                ),
+                'low_forced_stay': bool(action.get('low_forced_stay', False)),
+                'has_quasi_candidate': bool(
+                    action.get('has_quasi_candidate', False)
+                ),
             }
+            if action_by_mcs_id[agent.id]['requested_mode'] == 'Serve':
+                low_decision_id = action_by_mcs_id[agent.id][
+                    'low_decision_id'
+                ]
+                serve_option_id = action_by_mcs_id[agent.id][
+                    'serve_option_id'
+                ]
+                if (
+                    low_decision_id >= 0
+                    and serve_option_id >= 0
+                    and low_decision_id != serve_option_id
+                ):
+                    raise ValueError(
+                        '当前版本要求 low_decision_id 与 serve_option_id 一一对应'
+                    )
+                # 训练流程始终提供 ID；旧 test/test_actor 推理脚本没有
+                # rollout，因此允许 -1 并仅跳过 Low 学习归因。
+                agent.active_low_decision_id = low_decision_id
+                agent.active_serve_option_id = serve_option_id
+                agent.active_low_candidate_id = action_by_mcs_id[agent.id][
+                    'low_candidate_id'
+                ]
+                agent.active_low_started_step = self.current_step
+            else:
+                # 下一次明确 High=Recharge 时，旧空间决策不再生效。
+                agent.active_low_decision_id = -1
+                agent.active_serve_option_id = -1
+                agent.active_low_candidate_id = -1
+                agent.active_low_started_step = -1
             if mode == 'Recharge':
                 continue
             if mode == 'Wait':
@@ -321,6 +389,7 @@ class World:
                 not mcs.is_idle
                 and not mcs.is_recharging
                 and not mcs.is_broken
+                and not mcs.is_energy_stranded
                 and mcs.current_target is not None
             ):
                 mcs.advance_charging()
@@ -365,7 +434,7 @@ class World:
             action = action_by_mcs_id.get(mcs.id, {})
             requested_mode = action.get('requested_mode', default_mode)
             high_action_mask = np.asarray(
-                action.get('high_action_mask', [False, False, True]),
+                action.get('high_action_mask', [False, False]),
                 dtype=bool,
             ).reshape(-1)
             serve_available = bool(
@@ -374,17 +443,33 @@ class World:
             recharge_available = bool(
                 high_action_mask[1] if high_action_mask.size > 1 else False
             )
-            selected_wait = requested_mode == 'Wait'
+            low_stay_selected = bool(
+                action.get('low_stay_selected', False)
+            )
+            low_forced_stay = bool(action.get('low_forced_stay', False))
+            # High 已删除 Wait。Low 选择固定“当前位置”候选承载等待语义：
+            # 有其他 quasi 时是主动等待；只有当前位置时是被动等待。
+            # requested_mode == Wait 仅保留给旧调用方兼容。
+            legacy_selected_wait = requested_mode == 'Wait'
             forced_wait = bool(
-                selected_wait and not serve_available and not recharge_available
+                (low_stay_selected and low_forced_stay)
+                or (
+                    legacy_selected_wait
+                    and not serve_available
+                    and not recharge_available
+                )
             )
             voluntary_wait = bool(
-                selected_wait and (serve_available or recharge_available)
+                (low_stay_selected and not low_forced_stay)
+                or (
+                    legacy_selected_wait
+                    and (serve_available or recharge_available)
+                )
             )
             if voluntary_wait:
                 mcs.consecutive_voluntary_wait_steps += 1
             else:
-                # Serve、Recharge、forced Wait 或任务推进均会中断主动等待串。
+                # 移动 Serve、Recharge、被动等待或任务推进会中断主动等待串。
                 mcs.consecutive_voluntary_wait_steps = 0
 
             moved_distance_km = euclidean_distance(
@@ -394,6 +479,15 @@ class World:
             battery_delta = float(mcs.remain) - previous['remain']
             service_kwh = max(-battery_delta - movement_energy, 0.0) if involved_in_task else 0.0
             recharged_kwh = max(battery_delta + movement_energy, 0.0) if involved_in_recharge else 0.0
+            newly_energy_stranded = bool(
+                self._would_mcs_be_energy_stranded(mcs)
+                and not previous['is_energy_stranded']
+            )
+            if newly_energy_stranded:
+                # 与 broken 一样成为永久终止状态：不再参与匹配、邻居构建
+                # 或后续策略决策，但保留独立状态和审计事件。
+                mcs.is_energy_stranded = True
+                mcs.is_idle = False
             events[mcs.id] = {
                 'mode': action.get('mode', default_mode),
                 'requested_mode': requested_mode,
@@ -401,7 +495,16 @@ class World:
                 'waited': action.get('mode') == 'Wait',
                 'forced_wait': forced_wait,
                 'voluntary_wait': voluntary_wait,
-                'wait_duration_steps': 1 if selected_wait else 0,
+                'serve_available': serve_available,
+                'recharge_available': recharge_available,
+                'has_quasi_candidate': bool(
+                    action.get('has_quasi_candidate', False)
+                ),
+                'low_stay_selected': low_stay_selected,
+                'low_forced_stay': low_forced_stay,
+                'wait_duration_steps': (
+                    1 if (low_stay_selected or legacy_selected_wait) else 0
+                ),
                 'consecutive_voluntary_wait_steps': int(
                     mcs.consecutive_voluntary_wait_steps
                 ),
@@ -418,10 +521,25 @@ class World:
                 'previous_attraction': float(previous['spatial_attraction']),
                 'previous_competition': float(previous['spatial_competition']),
                 'previous_spatial_potential': float(previous['spatial_potential']),
+                'previous_low_spatial_attraction': float(
+                    previous['low_spatial_attraction']
+                ),
+                'previous_low_spatial_mcs_competition': float(
+                    previous['low_spatial_mcs_competition']
+                ),
+                'previous_low_spatial_fcs_competition': float(
+                    previous['low_spatial_fcs_competition']
+                ),
+                'previous_low_spatial_desirability': float(
+                    previous['low_spatial_desirability']
+                ),
                 'newly_broken': bool(mcs.is_broken and not previous['is_broken']),
+                'newly_energy_stranded': newly_energy_stranded,
                 'became_idle': bool(mcs.is_idle and not previous['is_idle']),
                 'became_task': bool(mcs.is_task and not previous['is_task']),
                 'became_recharging': bool(mcs.is_recharging and not previous['is_recharging']),
+                'low_decision_id': int(mcs.active_low_decision_id),
+                'serve_option_id': int(mcs.active_serve_option_id),
             }
         self.mcs_step_events = events
         # 失败责任必须使用匹配前状态。匹配后 idle MCS 可能已接到其他任务，
@@ -461,13 +579,52 @@ class World:
         # ── 即时匹配: IEV ↔ Idle MCS / Available FCS ──
         results = self.immediate_matcher.match_all(self.EVs, self.MCSs, self.FCSs)
         self.last_immediate_results = list(results)
+        ev_by_id = {ev.id: ev for ev in self.EVs}
+        mcs_by_id = {mcs.id: mcs for mcs in self.MCSs}
         for result in results:
-            if not result.get('success') or result.get('provider_type') != 'MCS':
+            if not result.get('success'):
                 continue
+            ev = ev_by_id.get(result.get('ev_id'))
+            if ev is not None:
+                feasible_mcs_count = max(
+                    int(result.get('feasible_mcs_count', 0)), 0
+                )
+                feasible_fcs_slots = max(
+                    int(result.get('feasible_fcs_slot_count', 0)), 0
+                )
+                ev.feasible_mcs_count = feasible_mcs_count
+                ev.feasible_fcs_slot_count = feasible_fcs_slots
+                # 无可行 FCS 时权重为 1；可替代 slot 越多，MCS 的系统
+                # 边际贡献越小。该代理来自匹配 hard constraints。
+                ev.service_marginal_weight = float(
+                    1.0 / (1.0 + feasible_fcs_slots)
+                )
+                ev.low_service_marginal_weight = (
+                    self.reward_builder.compute_low_success_marginal_weight(
+                        feasible_fcs_slots, feasible_mcs_count
+                    )
+                )
+            if result.get('provider_type') != 'MCS':
+                if ev is not None:
+                    ev.service_low_decision_id = -1
+                    ev.service_serve_option_id = -1
+                continue
+            provider = mcs_by_id.get(result.get('provider_id'))
+            low_decision_id = int(
+                getattr(provider, 'active_low_decision_id', -1)
+            )
+            serve_option_id = int(
+                getattr(provider, 'active_serve_option_id', -1)
+            )
+            if ev is not None:
+                ev.service_low_decision_id = low_decision_id
+                ev.service_serve_option_id = serve_option_id
             event = self.mcs_step_events.get(result.get('provider_id'))
             if event is not None:
                 event['became_task'] = True
                 event['matched_iev_id'] = result.get('ev_id', -1)
+                event['low_decision_id'] = low_decision_id
+                event['serve_option_id'] = serve_option_id
         if self.verbose:
             print(f'step{self.current_step}充电匹配阶段内：\n')
             for rst in results:
@@ -494,14 +651,24 @@ class World:
                 dist_km = euclidean_distance(mcs.pos[0], mcs.pos[1], ev.pos[0], ev.pos[1]) / 1000.0
                 if dist_km > COMM_RANGE:
                     continue
-                if not mcs.is_broken and not mcs.is_recharging and mcs.is_idle:
+                if (
+                    not mcs.is_broken
+                    and not mcs.is_energy_stranded
+                    and not mcs.is_recharging
+                    and mcs.is_idle
+                ):
                     # idle MCS
                     ev.near_idle_mcs.append(mcs)
                     if ev.is_quasi:
                         mcs.near_quasi.append(ev)
                     if ev.is_iev:
                         mcs.near_iev.append(ev)
-                elif not mcs.is_broken and not mcs.is_recharging and not mcs.is_idle:
+                elif (
+                    not mcs.is_broken
+                    and not mcs.is_energy_stranded
+                    and not mcs.is_recharging
+                    and not mcs.is_idle
+                ):
                     # task MCS
                     ev.near_task_mcs.append(mcs)
                     if ev.is_iev:
@@ -552,26 +719,47 @@ class World:
         # MCS-MCS 邻居
         for i in range(len(self.MCSs)):
             for j in range(i + 1, len(self.MCSs)):
-                if self.MCSs[i].is_broken or self.MCSs[i].is_recharging:
+                if (
+                    self.MCSs[i].is_broken
+                    or self.MCSs[i].is_energy_stranded
+                    or self.MCSs[i].is_recharging
+                ):
                     continue
                 dist_km = euclidean_distance(
                     self.MCSs[i].pos[0], self.MCSs[i].pos[1],
                     self.MCSs[j].pos[0], self.MCSs[j].pos[1]) / 1000.0
                 if dist_km > COMM_RANGE:
                     continue
-                if not self.MCSs[j].is_broken and not self.MCSs[j].is_recharging and self.MCSs[j].is_idle:
+                if (
+                    not self.MCSs[j].is_broken
+                    and not self.MCSs[j].is_energy_stranded
+                    and not self.MCSs[j].is_recharging
+                    and self.MCSs[j].is_idle
+                ):
                     self.MCSs[i].near_idle_mcs.append(self.MCSs[j])
-                elif not self.MCSs[j].is_broken and not self.MCSs[j].is_recharging and not self.MCSs[j].is_idle:
+                elif (
+                    not self.MCSs[j].is_broken
+                    and not self.MCSs[j].is_energy_stranded
+                    and not self.MCSs[j].is_recharging
+                    and not self.MCSs[j].is_idle
+                ):
                     self.MCSs[i].near_task_mcs.append(self.MCSs[j])
-                if self.MCSs[i].is_idle:
+                if self.MCSs[i].is_idle and not self.MCSs[i].is_energy_stranded:
                     self.MCSs[j].near_idle_mcs.append(self.MCSs[i])
-                elif not self.MCSs[i].is_idle:
+                elif (
+                    not self.MCSs[i].is_idle
+                    and not self.MCSs[i].is_energy_stranded
+                ):
                     self.MCSs[j].near_task_mcs.append(self.MCSs[i])
 
         # MCS-FCS 邻居
         for i in range(len(self.MCSs)):
             for j in range(len(self.FCSs)):
-                if self.MCSs[i].is_broken or self.MCSs[i].is_recharging:
+                if (
+                    self.MCSs[i].is_broken
+                    or self.MCSs[i].is_energy_stranded
+                    or self.MCSs[i].is_recharging
+                ):
                     continue
                 dist_km = euclidean_distance(
                     self.MCSs[i].pos[0], self.MCSs[i].pos[1],
@@ -591,7 +779,12 @@ class World:
         for ev in iev_list:
             self.agents.append(ev)
         for mcs in self.MCSs:
-            if not mcs.is_broken and not mcs.is_recharging and mcs.is_idle:
+            if (
+                not mcs.is_broken
+                and not mcs.is_energy_stranded
+                and not mcs.is_recharging
+                and mcs.is_idle
+            ):
                 self.agents.append(mcs)
 
     # ============================================================
@@ -606,7 +799,7 @@ class World:
 
         for agent in self.agents:
             if isinstance(agent, MCS):
-                new_obs_n.append(self.obs_builder.obs_mcs(agent))
+                new_obs_n.append(self.obs_builder.obs_mcs(agent, self.FCSs))
             else:
                 new_obs_n.append(self.obs_builder.obs_iev(agent))
 
@@ -628,11 +821,16 @@ class World:
                     low_self_state = np.zeros(MCS_FEAT_DIM_self, dtype=np.float32)
                     old_obs_n.append({
                         'high_state': np.zeros(MCS_HIGH_FEAT_DIM, dtype=np.float32),
-                        'high_action_mask': np.asarray([False, False, True], dtype=bool),
+                        'high_action_mask': np.asarray([False, False], dtype=bool),
                         'low_self_state': low_self_state,
                         'low_candidates': low_candidates,
                         'low_candidate_mask': low_candidate_mask,
                         'candidate_ids': np.full(TOP_K_MCS_CANDIDATES, -1, dtype=np.int64),
+                        'candidate_is_stay': np.zeros(
+                            TOP_K_MCS_CANDIDATES, dtype=bool
+                        ),
+                        'quasi_candidate_count': 0,
+                        'stay_candidate_index': 0,
                         'obs_self': low_self_state,
                         'obs_tgt': low_candidates,
                         'mask': np.logical_not(low_candidate_mask),
@@ -671,6 +869,12 @@ class World:
         mcs_success_count_by_id: Dict[int, int] = {
             mcs.id: 0 for mcs in self.MCSs
         }
+        mcs_success_weight_by_id: Dict[int, float] = {
+            mcs.id: 0.0 for mcs in self.MCSs
+        }
+        low_success_weight_by_decision: Dict[int, float] = {}
+        low_failure_weight_by_decision: Dict[int, float] = {}
+        self.last_low_event_records = []
         new_mcs_success_count = 0
         new_fcs_success_count = 0
         unattributed_mcs_success_count = 0
@@ -679,10 +883,57 @@ class World:
                 new_mcs_success_count += 1
                 if ev.charge_provider_id in mcs_success_count_by_id:
                     mcs_success_count_by_id[ev.charge_provider_id] += 1
+                    marginal_weight = float(np.clip(
+                        getattr(ev, 'service_marginal_weight', 1.0),
+                        0.0,
+                        1.0,
+                    ))
+                    mcs_success_weight_by_id[
+                        ev.charge_provider_id
+                    ] += marginal_weight
+                    low_decision_id = int(getattr(
+                        ev, 'service_low_decision_id', -1
+                    ))
+                    if low_decision_id >= 0:
+                        low_marginal_weight = float(np.clip(
+                            getattr(
+                                ev, 'low_service_marginal_weight',
+                                marginal_weight,
+                            ),
+                            0.0,
+                            1.0,
+                        ))
+                        low_success_weight_by_decision[low_decision_id] = (
+                            low_success_weight_by_decision.get(
+                                low_decision_id, 0.0
+                            ) + low_marginal_weight
+                        )
+                    self.last_low_event_records.append({
+                        'ev_id': int(ev.id),
+                        'kind': 'mcs_success',
+                        'low_decision_id': low_decision_id,
+                        'responsibility_weight': (
+                            low_marginal_weight
+                            if low_decision_id >= 0 else 0.0
+                        ),
+                        'high_responsibility_weight': marginal_weight,
+                        'feasible_mcs_count': int(getattr(
+                            ev, 'feasible_mcs_count', 0
+                        )),
+                        'feasible_fcs_slot_count': int(getattr(
+                            ev, 'feasible_fcs_slot_count', 0
+                        )),
+                    })
                 else:
                     unattributed_mcs_success_count += 1
             elif ev.charge_provider_type == 'FCS':
                 new_fcs_success_count += 1
+                self.last_low_event_records.append({
+                    'ev_id': int(ev.id),
+                    'kind': 'fcs_success_kpi',
+                    'low_decision_id': -1,
+                    'responsibility_weight': 0.0,
+                })
 
         failure_weight_by_mcs_id: Dict[int, float] = {
             mcs.id: 0.0 for mcs in self.MCSs
@@ -693,14 +944,40 @@ class World:
             weights = self.pending_failure_responsibilities.get(ev.id, {})
             if weights:
                 controllable_failure_count += 1
+                low_event_weight_sum = 0.0
                 for mcs_id, weight in weights.items():
                     if mcs_id in failure_weight_by_mcs_id:
                         failure_weight_by_mcs_id[mcs_id] += float(weight)
+                        low_decision_id = int(
+                            self.mcs_step_events.get(mcs_id, {}).get(
+                                'low_decision_id', -1
+                            )
+                        )
+                        if low_decision_id >= 0:
+                            low_failure_weight_by_decision[low_decision_id] = (
+                                low_failure_weight_by_decision.get(
+                                    low_decision_id, 0.0
+                                ) + float(weight)
+                            )
+                            low_event_weight_sum += float(weight)
+                self.last_low_event_records.append({
+                    'ev_id': int(ev.id),
+                    'kind': 'controllable_failure',
+                    'low_decision_id': -1,
+                    'responsibility_weight': float(low_event_weight_sum),
+                })
             else:
                 uncontrollable_failure_count += 1
 
-        success_weight_sum = float(sum(mcs_success_count_by_id.values()))
+        attributed_success_count = int(sum(mcs_success_count_by_id.values()))
+        success_weight_sum = float(sum(mcs_success_weight_by_id.values()))
         failure_weight_sum = float(sum(failure_weight_by_mcs_id.values()))
+        low_success_weight_sum = float(sum(
+            low_success_weight_by_decision.values()
+        ))
+        low_failure_weight_sum = float(sum(
+            low_failure_weight_by_decision.values()
+        ))
         forced_wait_count = sum(
             bool(event.get('forced_wait', False))
             for event in self.mcs_step_events.values()
@@ -709,28 +986,49 @@ class World:
             bool(event.get('voluntary_wait', False))
             for event in self.mcs_step_events.values()
         )
+        energy_stranded_count = sum(
+            bool(event.get('newly_energy_stranded', False))
+            for event in self.mcs_step_events.values()
+        )
+        low_active_wait_count = sum(
+            bool(event.get('low_stay_selected', False))
+            and not bool(event.get('low_forced_stay', False))
+            for event in self.mcs_step_events.values()
+        )
+        low_passive_wait_count = sum(
+            bool(event.get('low_stay_selected', False))
+            and bool(event.get('low_forced_stay', False))
+            for event in self.mcs_step_events.values()
+        )
         self.last_system_reward_event = {
             'new_success_count': len(new_success_evs),
             'new_failure_count': len(new_failure_evs),
             'new_mcs_success_count': new_mcs_success_count,
             'new_fcs_success_count': new_fcs_success_count,
+            'fcs_success_kpi_count': new_fcs_success_count,
             'unattributed_mcs_success_count': unattributed_mcs_success_count,
-            'attributed_mcs_success_count': int(success_weight_sum),
+            'attributed_mcs_success_count': attributed_success_count,
             'attributed_mcs_success_weight_sum': success_weight_sum,
+            'low_attributed_mcs_success_weight_sum': low_success_weight_sum,
             'controllable_failure_count': controllable_failure_count,
             'uncontrollable_failure_count': uncontrollable_failure_count,
             'controllable_failure_weight_sum': failure_weight_sum,
+            'low_controllable_failure_weight_sum': low_failure_weight_sum,
             'forced_wait_count': forced_wait_count,
             'voluntary_wait_count': voluntary_wait_count,
+            'energy_stranded_count': energy_stranded_count,
+            'low_active_wait_count': low_active_wait_count,
+            'low_passive_wait_count': low_passive_wait_count,
         }
 
         self.last_mcs_reward_components = {}
+        self.last_low_reward_by_decision = {}
         for mcs in self.MCSs:
             event = self.mcs_step_events.get(mcs.id, {})
             attributed_success_count = mcs_success_count_by_id.get(mcs.id, 0)
             event['attributed_mcs_success_count'] = attributed_success_count
             event['attributed_mcs_success_weight'] = float(
-                attributed_success_count
+                mcs_success_weight_by_id.get(mcs.id, 0.0)
             )
             event['controllable_failure_weight'] = float(
                 failure_weight_by_mcs_id.get(mcs.id, 0.0)
@@ -742,15 +1040,57 @@ class World:
                 uncontrollable_failure_count
             )
             event['fcs_success_kpi_count'] = new_fcs_success_count
+            low_decision_id = int(event.get('low_decision_id', -1))
+            event['low_attributed_mcs_success_weight'] = float(
+                low_success_weight_by_decision.get(low_decision_id, 0.0)
+                if low_decision_id >= 0 else 0.0
+            )
+            event['low_controllable_failure_weight'] = float(
+                low_failure_weight_by_decision.get(low_decision_id, 0.0)
+                if low_decision_id >= 0 else 0.0
+            )
             post_spatial = self.reward_builder.compute_mcs_spatial_features(
                 mcs, self.EVs, self.MCSs, self.FCSs
+            )
+            post_low_spatial = (
+                self.reward_builder.compute_low_spatial_features(
+                    mcs, self.EVs, self.FCSs
+                )
             )
             event['post_attraction'] = post_spatial['attraction']
             event['post_competition'] = post_spatial['competition']
             event['post_spatial_potential'] = post_spatial['potential']
+            event['post_immediate_iev_demand'] = post_spatial[
+                'immediate_iev_demand'
+            ]
+            event['post_mcs_competition'] = post_spatial[
+                'mcs_competition'
+            ]
+            event['post_fcs_competition'] = post_spatial[
+                'fcs_competition'
+            ]
+            event['post_low_attraction'] = post_low_spatial['attraction']
+            event['post_low_immediate_iev_attraction'] = post_low_spatial[
+                'immediate_iev_attraction'
+            ]
+            event['post_low_mcs_competition'] = post_low_spatial[
+                'mcs_competition'
+            ]
+            event['post_low_fcs_competition'] = post_low_spatial[
+                'fcs_competition'
+            ]
+            event['post_low_spatial_desirability'] = post_low_spatial[
+                'desirability'
+            ]
             components = self.reward_builder.compute_mcs_reward(mcs, event)
             self.last_mcs_reward_components[mcs.id] = components
             mcs.total_reward += components['total']
+            if low_decision_id >= 0 and components['low_total'] != 0.0:
+                self.last_low_reward_by_decision[low_decision_id] = float(
+                    self.last_low_reward_by_decision.get(
+                        low_decision_id, 0.0
+                    ) + components['low_total']
+                )
 
         reward_n = []
         for agent in self.last_agents:
@@ -788,9 +1128,11 @@ class World:
             elif e.is_fail:
                 n_fail += 1
         # 统计MCS
-        n_idle, n_task, n_recharging, n_broken = 0, 0, 0, 0
+        n_idle, n_task, n_recharging, n_broken, n_energy_stranded = 0, 0, 0, 0, 0
         for m in self.MCSs:
-            if m.is_idle and not m.is_broken and not m.is_recharging:
+            if m.is_energy_stranded:
+                n_energy_stranded += 1
+            elif m.is_idle and not m.is_broken and not m.is_recharging:
                 n_idle += 1
             elif m.is_task:
                 n_task += 1
@@ -808,7 +1150,9 @@ class World:
             'step': self.current_step,
             'num_iev': n_iev, 'num_quasi': n_quasi, 'num_charging': n_charging,
             'num_success': n_success, 'num_fail': n_fail,
-            'num_idle_mcs': n_idle, 'num_task_mcs': n_task, 'num_recharge_mcs': n_recharging, 'num_broken': n_broken,
+            'num_idle_mcs': n_idle, 'num_task_mcs': n_task,
+            'num_recharge_mcs': n_recharging, 'num_broken': n_broken,
+            'num_energy_stranded': n_energy_stranded,
             'avail_slots': avail_slots, 'occ_slots': occ_slots,
             'num_agents': len(self.agents),
         }

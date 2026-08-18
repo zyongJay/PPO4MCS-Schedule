@@ -3,6 +3,16 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 from config import *
 from core import EV, MCS, FCS, euclidean_distance
+from low_spatial import (
+    compute_low_candidate_metrics,
+    compute_low_stay_metrics,
+    ev_service_opportunity,
+    quasi_transition_urgency,
+)
+
+
+# Low 候选 ID：-1 保留给 padding；-2 表示“MCS当前位置”固定动作。
+MCS_STAY_CANDIDATE_ID = -2
 
 MCS_HIGH_FEATURE_NAMES = (
     'remain_ratio',
@@ -15,11 +25,11 @@ MCS_HIGH_FEATURE_NAMES = (
 )
 MCS_LOW_SELF_FEATURE_NAMES = (
     'remain_ratio',
-    'local_need_supply_ratio',
+    'local_unserved_opportunity_ratio',
     'near_quasi_count_ratio',
 )
 MCS_LOW_CANDIDATE_FEATURE_NAMES = (
-    'need_power_ratio',
+    'quasi_service_opportunity_ratio',
     'distance_ratio',
     'attraction_ratio',
     'competition_mcs_ratio',
@@ -36,7 +46,88 @@ class ObservationBuilder:
     结构兼容 env/world.py 的 get_agent_obs()。
     """
 
-    def obs_mcs(self, mcs: MCS):
+    @staticmethod
+    def get_reachable_serve_candidates(
+        mcs: MCS,
+        all_fcss: List[FCS],
+        apply_topk: bool = True,
+    ) -> List[EV]:
+        """返回安全可达且补电紧急度最高的至多 TopK-1 个 quasi。
+
+        Serve 候选的能量硬约束同时覆盖两段移动：
+        ``MCS当前位置 -> quasi -> 距离该quasi最近的FCS``。最近 FCS 从全图
+        物理站点中选择，不要求当前存在空闲槽；空闲槽属于未来 Recharge
+        匹配条件，不应改变当前 Serve 选位的返程安全性。
+
+        环境执行 Serve 移动时，若剩余电量小于或等于到达目标所需电量，
+        MCS 会在途中耗尽电量并进入 broken。因此这里对两段总耗电采用严格
+        大于关系，并在紧急度排序与 TopK 截断前过滤。合法候选优先按
+        “剩余电量接近 IEV 阈值”的程度排序，再用距离和 ID 打破平局。
+        """
+        reachable_candidates: List[EV] = []
+        if not all_fcss:
+            return reachable_candidates
+
+        for quasi in mcs.near_quasi:
+            if not quasi.is_quasi:
+                continue
+            distance_to_quasi_km = euclidean_distance(
+                mcs.pos[0], mcs.pos[1], quasi.pos[0], quasi.pos[1]
+            ) / 1000.0
+            nearest_fcs_distance_km = min(
+                euclidean_distance(
+                    quasi.pos[0], quasi.pos[1], fcs.pos[0], fcs.pos[1]
+                ) / 1000.0
+                for fcs in all_fcss
+            )
+            required_energy = (
+                distance_to_quasi_km + nearest_fcs_distance_km
+            ) * POWER_UNIT
+            if float(mcs.remain) > required_energy:
+                reachable_candidates.append(quasi)
+
+        # Top-K 优先保留最接近转变为 IEV 的 quasi。距离只作为同紧急度
+        # 下的次级排序，ID 用于保证完全相同时结果可复现。
+        reachable_candidates.sort(key=lambda quasi: (
+            -quasi_transition_urgency(quasi),
+            euclidean_distance(
+                mcs.pos[0], mcs.pos[1], quasi.pos[0], quasi.pos[1]
+            ),
+            int(quasi.id),
+        ))
+        if not apply_topk:
+            return reachable_candidates
+        # Low 候选空间始终为“MCS当前位置”预留一个固定槽位。
+        quasi_capacity = max(int(TOP_K_MCS_CANDIDATES) - 1, 0)
+        return reachable_candidates[:quasi_capacity]
+
+    @staticmethod
+    def get_reachable_recharge_candidates(
+        mcs: MCS,
+        all_fcss: List[FCS],
+    ) -> List[tuple[FCS, float, float]]:
+        """返回全图中当前有空闲槽且电量能够到达的 FCS。
+
+        Recharge 是全图规划动作，不受 MCS 通信范围限制；通信范围仍只
+        用于局部空间观测和竞争特征。High mask 同时检查当前空闲槽和
+        物理能量可达性；多个 MCS 对同一槽位的竞争仍由 RechargeMatcher
+        在执行阶段全局处理。
+        """
+        reachable_fcss: List[tuple[FCS, float, float]] = []
+        for fcs in all_fcss:
+            if fcs.available_slots <= 0:
+                continue
+            distance_km = euclidean_distance(
+                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
+            ) / 1000.0
+            required_energy = distance_km * POWER_UNIT
+            if float(mcs.remain) + 1e-12 >= required_energy:
+                reachable_fcss.append((fcs, distance_km, required_energy))
+
+        reachable_fcss.sort(key=lambda item: item[1])
+        return reachable_fcss
+
+    def obs_mcs(self, mcs: MCS, all_fcss: Optional[List[FCS]] = None):
         """Build normalized local observations for the MCS high/low actors.
 
         Mask conventions intentionally differ from the legacy ``mask`` field:
@@ -45,23 +136,33 @@ class ObservationBuilder:
         callers are not broken.
         """
         eps = 1e-8
-        candidates: List[EV] = [ev for ev in mcs.near_quasi if ev.is_quasi]
-        candidates.sort(
-            key=lambda ev: euclidean_distance(
-                mcs.pos[0], mcs.pos[1], ev.pos[0], ev.pos[1]
-            )
+        # Serve 的返程安全检查使用全图物理 FCS；独立调用未传入全图列表时，
+        # 兼容性回退到当前已知的局部 available/busy FCS。
+        serve_safety_fcss = (
+            list(all_fcss)
+            if all_fcss is not None
+            else list(mcs.near_available_fcs) + list(mcs.near_busy_fcs)
         )
-        candidates = candidates[:TOP_K_MCS_CANDIDATES]
+        # 先剔除无法依次到达 quasi 和最近 FCS 的候选，再排序并选择 TopK。
+        ranked_safe_candidates = self.get_reachable_serve_candidates(
+            mcs, serve_safety_fcss, apply_topk=False
+        )
+        quasi_capacity = max(int(TOP_K_MCS_CANDIDATES) - 1, 0)
+        candidates = ranked_safe_candidates[:quasi_capacity]
+        raw_quasi_count = sum(ev.is_quasi for ev in mcs.near_quasi)
+        safe_quasi_count = len(ranked_safe_candidates)
+        topk_truncated_count = max(safe_quasi_count - quasi_capacity, 0)
 
-        # Only local, physically valid FCSs may enable the Recharge action.
-        reachable_fcs = []
-        for fcs in mcs.near_available_fcs:
-            dist_km = euclidean_distance(
-                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
-            ) / 1000.0
-            required_energy = dist_km * POWER_UNIT
-            if dist_km <= COMM_RANGE and mcs.remain > required_energy:
-                reachable_fcs.append((fcs, dist_km, required_energy))
+        # Recharge 在全图 FCS 上规划；未显式传入时回退到当前已知的全部
+        # 局部物理 FCS。候选函数会进一步排除没有空闲槽的 busy FCS。
+        recharge_fcss = (
+            list(all_fcss)
+            if all_fcss is not None
+            else list(mcs.near_available_fcs) + list(mcs.near_busy_fcs)
+        )
+        reachable_fcs = self.get_reachable_recharge_candidates(
+            mcs, recharge_fcss
+        )
 
         need = sum(ev.need_power for ev in mcs.near_iev)
         for ev in mcs.near_quasi:
@@ -78,6 +179,25 @@ class ObservationBuilder:
         )
         local_need_supply_ratio = need / (need + support + eps)
 
+        # Low 只使用按 EV 数量和紧迫度构造的局部服务缺口，不使用 kWh。
+        # High 仍保留上面的能量供需比，用于模式与能源规划，两层语义独立。
+        low_opportunity = sum(
+            ev_service_opportunity(ev) for ev in mcs.near_quasi
+            if ev.is_quasi
+        )
+        low_alternative_capacity = float(
+            len([
+                other for other in mcs.near_idle_mcs
+                if not other.is_broken
+                and not getattr(other, 'is_energy_stranded', False)
+            ])
+            + sum(fcs.available_slots for fcs in mcs.near_available_fcs)
+        )
+        low_unserved_opportunity_ratio = (
+            low_opportunity
+            / (low_opportunity + low_alternative_capacity + eps)
+        )
+
         remain_ratio = float(np.clip(
             mcs.remain / max(MCS_BATTERY_CAPACITY, eps), 0.0, 1.0
         ))
@@ -85,7 +205,14 @@ class ObservationBuilder:
             _, nearest_dist_km, required_energy = min(
                 reachable_fcs, key=lambda item: item[1]
             )
-            nearest_fcs_distance_ratio = nearest_dist_km / max(COMM_RANGE, eps)
+            # 全图候选可能超过通信范围。用地图对角线归一化，避免所有
+            # 远端 FCS 的距离特征都被裁剪为 1。
+            map_diagonal_km = euclidean_distance(
+                AREA_LON_MIN, AREA_LAT_MIN, AREA_LON_MAX, AREA_LAT_MAX
+            ) / 1000.0
+            nearest_fcs_distance_ratio = (
+                nearest_dist_km / max(map_diagonal_km, eps)
+            )
             recharge_margin_ratio = (
                 mcs.remain - required_energy
             ) / max(MCS_BATTERY_CAPACITY, eps)
@@ -100,6 +227,7 @@ class ObservationBuilder:
             fcs.available_slots for fcs in mcs.near_available_fcs
         )
         near_iev_demand = sum(ev.need_power for ev in mcs.near_iev)
+        quasi_candidate_capacity = max(TOP_K_MCS_CANDIDATES - 1, 1)
 
         high_state = np.asarray([
             remain_ratio,
@@ -107,7 +235,7 @@ class ObservationBuilder:
             np.clip(recharge_margin_ratio, 0.0, 1.0),
             np.clip(local_available_slots / local_slot_capacity, 0.0, 1.0),
             np.clip(local_need_supply_ratio, 0.0, 1.0),
-            np.clip(len(mcs.near_quasi) / max(TOP_K_MCS_CANDIDATES, 1), 0.0, 1.0),
+            np.clip(len(candidates) / quasi_candidate_capacity, 0.0, 1.0),
             np.clip(
                 near_iev_demand /
                 max(TOP_K_MCS_CANDIDATES * MAX_CHARGE_PER_SESSION_KWH, eps),
@@ -116,67 +244,62 @@ class ObservationBuilder:
             ),
         ], dtype=np.float32)
         high_action_mask = np.asarray([
-            bool(candidates),       # 0 = Serve
-            bool(reachable_fcs),    # 1 = Recharge
-            True,                   # 2 = Wait
+            True,                   # 0 = Serve；当前位置固定候选始终保底
+            bool(reachable_fcs),    # 1 = Recharge；要求有空闲槽且电量可达
         ], dtype=bool)
 
-        candidate_features = []
-        candidate_ids = []
+        if TOP_K_MCS_CANDIDATES < 1:
+            raise RuntimeError('TOP_K_MCS_CANDIDATES 至少为 1，需容纳当前位置动作')
+
+        # index=0 永远是 MCS 当前位置。存在其他 quasi 时选择它表示主动
+        # 等待；没有其他 quasi 时它是唯一合法候选，表示被动等待。
+        stay_metrics = compute_low_stay_metrics(mcs)
+        candidate_features = [[
+            stay_metrics['urgency_demand'],
+            stay_metrics['distance_ratio'],
+            stay_metrics['attraction'],
+            stay_metrics['mcs_competition'],
+            stay_metrics['fcs_competition'],
+        ]]
+        candidate_ids = [MCS_STAY_CANDIDATE_ID]
+        candidate_is_stay = [True]
+        candidate_urgencies = [0.0]
+        candidate_desirabilities = [stay_metrics['desirability']]
+        candidate_remain_kwh = [-1.0]
+        candidate_need_power_kwh = [-1.0]
         for quasi in candidates:
-            dist_km = euclidean_distance(
-                mcs.pos[0], mcs.pos[1], quasi.pos[0], quasi.pos[1]
-            ) / 1000.0
-            attraction = 0.0
-            competition_mcs = 0.0
-            competition_fcs = 0.0
-
-            for other in quasi.near_quasi + quasi.near_iev:
-                other_dist_km = euclidean_distance(
-                    quasi.pos[0], quasi.pos[1], other.pos[0], other.pos[1]
-                ) / 1000.0
-                weight = 1.5 if other.is_iev else 1.0
-                attraction += weight * other.need_power / (other_dist_km + 1.0)
-
-            for other in quasi.near_idle_mcs:
-                if other.id == mcs.id:
-                    continue
-                other_dist_km = euclidean_distance(
-                    quasi.pos[0], quasi.pos[1], other.pos[0], other.pos[1]
-                ) / 1000.0
-                competition_mcs += (
-                    min(other.remain, MAX_CHARGE_PER_SESSION_KWH) /
-                    max(MAX_CHARGE_PER_SESSION_KWH, eps) /
-                    (other_dist_km + 1.0)
-                )
-
-            for fcs in quasi.near_available_fcs:
-                other_dist_km = euclidean_distance(
-                    quasi.pos[0], quasi.pos[1], fcs.pos[0], fcs.pos[1]
-                ) / 1000.0
-                competition_fcs += fcs.available_slots / (other_dist_km + 1.0)
-
+            metrics = compute_low_candidate_metrics(mcs, quasi)
             candidate_features.append([
-                np.clip(quasi.need_power / max(MAX_CHARGE_PER_SESSION_KWH, eps), 0.0, 1.0),
-                np.clip(dist_km / max(COMM_RANGE, eps), 0.0, 1.0),
-                np.clip(attraction / (attraction + MAX_CHARGE_PER_SESSION_KWH + eps), 0.0, 1.0),
-                np.clip(competition_mcs / (competition_mcs + 1.0), 0.0, 1.0),
-                np.clip(competition_fcs / (competition_fcs + 1.0), 0.0, 1.0),
+                metrics['urgency_demand'],
+                metrics['distance_ratio'],
+                metrics['attraction'],
+                metrics['mcs_competition'],
+                metrics['fcs_competition'],
             ])
             candidate_ids.append(int(quasi.id))
+            candidate_is_stay.append(False)
+            candidate_urgencies.append(quasi_transition_urgency(quasi))
+            candidate_desirabilities.append(metrics['desirability'])
+            candidate_remain_kwh.append(float(quasi.remain))
+            candidate_need_power_kwh.append(float(quasi.need_power))
 
         valid_count = len(candidate_features)
         while len(candidate_features) < TOP_K_MCS_CANDIDATES:
             candidate_features.append([0.0] * MCS_FEAT_DIM_tgt)
             candidate_ids.append(-1)
+            candidate_is_stay.append(False)
+            candidate_urgencies.append(0.0)
+            candidate_desirabilities.append(0.0)
+            candidate_remain_kwh.append(-1.0)
+            candidate_need_power_kwh.append(-1.0)
 
         low_candidates = np.asarray(candidate_features, dtype=np.float32)
         low_candidate_mask = np.zeros(TOP_K_MCS_CANDIDATES, dtype=bool)
         low_candidate_mask[:valid_count] = True
         low_self_state = np.asarray([
             remain_ratio,
-            np.clip(local_need_supply_ratio, 0.0, 1.0),
-            np.clip(len(mcs.near_quasi) / max(TOP_K_MCS_CANDIDATES, 1), 0.0, 1.0),
+            np.clip(low_unserved_opportunity_ratio, 0.0, 1.0),
+            np.clip(len(candidates) / quasi_candidate_capacity, 0.0, 1.0),
         ], dtype=np.float32)
 
         return {
@@ -186,6 +309,25 @@ class ObservationBuilder:
             'low_candidates': low_candidates,
             'low_candidate_mask': low_candidate_mask,
             'candidate_ids': np.asarray(candidate_ids, dtype=np.int64),
+            'candidate_is_stay': np.asarray(candidate_is_stay, dtype=bool),
+            # 以下数组仅用于审计日志，不进入 Actor/Critic 张量。
+            'candidate_urgencies': np.asarray(
+                candidate_urgencies, dtype=np.float32
+            ),
+            'candidate_desirabilities': np.asarray(
+                candidate_desirabilities, dtype=np.float32
+            ),
+            'candidate_remain_kwh': np.asarray(
+                candidate_remain_kwh, dtype=np.float32
+            ),
+            'candidate_need_power_kwh': np.asarray(
+                candidate_need_power_kwh, dtype=np.float32
+            ),
+            'raw_quasi_count': int(raw_quasi_count),
+            'safe_quasi_count': int(safe_quasi_count),
+            'topk_truncated_count': int(topk_truncated_count),
+            'quasi_candidate_count': int(len(candidates)),
+            'stay_candidate_index': 0,
             # Backward-compatible aliases used by the current baseline script.
             'obs_self': low_self_state,
             'obs_tgt': low_candidates,
@@ -283,10 +425,15 @@ class ObservationBuilder:
         for mcs in MCSs:
             per_mcs.append([
                 np.clip(mcs.remain / max(MCS_BATTERY_CAPACITY, eps), 0.0, 1.0),
-                float(mcs.is_idle and not mcs.is_broken and not mcs.is_recharging),
+                float(
+                    mcs.is_idle
+                    and not mcs.is_broken
+                    and not mcs.is_energy_stranded
+                    and not mcs.is_recharging
+                ),
                 float(mcs.is_task),
                 float(mcs.is_recharging),
-                float(mcs.is_broken),
+                float(mcs.is_broken or mcs.is_energy_stranded),
                 np.clip(
                     mcs.charge_power_kwh /
                     max(MAX_CHARGE_PER_SESSION_KWH, eps),

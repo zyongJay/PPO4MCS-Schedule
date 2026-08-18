@@ -35,9 +35,11 @@ FCS_SLOTS_PER_STATION = 3
 # ============================
 MOVE_SPEED = 11  # 移动速度（m/s）
 CHARGE_SPEED = 120.0  # 充电功率 (kWh/h)
+RECHARGE_SPEED = 360.0    # 补电功率 (kWh/h)
 POWER_UNIT = 0.3  # 单位距离能耗 (kWh/km)
 
 CHARGE_SPEED_PER_MIN = CHARGE_SPEED / 60.0  # 2 kWh/min
+RECHARGE_SPEED_PER_MIN = RECHARGE_SPEED / 60.0  # 6 kWh/min
 
 # ============================
 # 4. 电池参数 (简化)
@@ -59,8 +61,9 @@ MAX_STEPS_PER_EPISODE = 200
 # ============================
 # 6. 充电参数
 # ============================
-MAX_CHARGE_PER_SESSION_KWH = CHARGE_SPEED_PER_MIN * STEP_DURATION_MIN * MAX_WAIT_TIME_STEPS
-MAX_RECHARGE_PER_SESSION_KWH = MAX_CHARGE_PER_SESSION_KWH  # kwh
+MAX_CHARGE_PER_SESSION_KWH = CHARGE_SPEED_PER_MIN * STEP_DURATION_MIN * MAX_WAIT_TIME_STEPS     # 单次充电上限
+# MAX_RECHARGE_PER_SESSION_KWH = MAX_CHARGE_PER_SESSION_KWH  # kwh
+MAX_RECHARGE_PER_SESSION_KWH = 300      # 单次补电上限
 MAX_CHARGE_TIME_MIN = 20.0
 
 # ============================

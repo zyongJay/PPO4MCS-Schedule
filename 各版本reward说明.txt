@@ -3,3 +3,6 @@
 3.training_results_v3：仅用 竞争/吸引力即时奖励，屏蔽基于事件的奖励
 4.training_results_v4：引入"系统级"全局奖励，增/减EV数量 平均分配给每个MCS
 5.training_results_v5：将"充电成功EV数"奖励分配给指导MCS、优化Wait惩罚策略、剔除FCS完成的EV充电产生的奖励
+6.training_results_v6：解耦High/Low Critic
+7.training_results_v7：增加单次补电量与速度
+8.training_results_v8：仿真规则保证 MCS全局匹配FCS MCS严格安全不会broken wait动作转移至Low层 TopK quasi候选按照紧急程度排序 优化Low Reward 奖励远离竞争而不考虑充电量

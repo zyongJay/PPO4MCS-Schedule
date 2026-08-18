@@ -1,0 +1,4 @@
+﻿scenario_seed,steps,ev_success_count,ev_failure_count,ev_charge_success_ratio,successful_ev_mcs_count,successful_ev_fcs_count,broken_mcs_count,FCS_1_nearby_mcs_mean,FCS_1_nearby_mcs_max,FCS_2_nearby_mcs_mean,FCS_2_nearby_mcs_max,FCS_3_nearby_mcs_mean,FCS_3_nearby_mcs_max,FCS_4_nearby_mcs_mean,FCS_4_nearby_mcs_max,FCS_5_nearby_mcs_mean,FCS_5_nearby_mcs_max,checkpoint_episode
+1001,200,218,67,0.7649122807017544,122,96,6,0.004975124378109453,1,0.22885572139303484,1,0.6517412935323383,2,0.5024875621890548,2,0.0945273631840796,1,300
+1002,200,211,66,0.7617328519855595,119,92,6,0.4925373134328358,2,1.5174129353233832,4,1.044776119402985,3,0.11940298507462686,3,0.0,0,300
+1003,200,233,48,0.8291814946619217,118,115,2,1.263681592039801,3,1.1592039800995024,6,0.24875621890547264,1,0.2537313432835821,1,0.0,0,300

@@ -1,6 +1,7 @@
 """Neural networks for option-aware MCS-only MAPPO/PPO training.
 
-High actions use the fixed indices 0=Serve, 1=Recharge, 2=Wait.  Both actor
+High actions use the fixed indices 0=Serve, 1=Recharge.  Waiting is a fixed
+Low candidate representing the MCS current position.  Both actor
 levels apply boolean masks directly to logits; True means the action/candidate
 was physically valid at sampling time.  IEV movement is environment-controlled
 and has no trainable actor in this module.
@@ -17,7 +18,7 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 TensorLike = Union[np.ndarray, torch.Tensor]
-MCS_ACTION_NAMES = ("Serve", "Recharge", "Wait")
+MCS_ACTION_NAMES = ("Serve", "Recharge")
 
 
 def masked_categorical(
@@ -42,7 +43,7 @@ def masked_categorical(
 
 
 class MCSHighActor(nn.Module):
-    """Local High Actor: normalized high state -> Serve/Recharge/Wait logits."""
+    """Local High Actor: normalized high state -> Serve/Recharge logits."""
 
     def __init__(self, state_dim: int, hidden_dim: int = 128):
         super().__init__()
@@ -124,7 +125,7 @@ class MCSLowActor(nn.Module):
 
 
 class CentralizedCritic(nn.Module):
-    """Centralized value function over a normalized fixed-width global state."""
+    """High Critic：全局状态与 High 局部状态拼接后的价值函数。"""
 
     def __init__(self, state_dim: int, hidden_dim: int = 128):
         super().__init__()
@@ -141,8 +142,70 @@ class CentralizedCritic(nn.Module):
         return self.net(global_state).squeeze(-1)
 
 
+class LowCentralizedCritic(nn.Module):
+    """Low Critic：使用掩码候选集合池化，避免依赖固定 TopK 展平。
+
+    每个候选先经过共享编码器，再对合法候选执行 masked mean/max
+    pooling。这样以后扩大候选数量时，无需改变 Critic 输入宽度。
+    """
+
+    def __init__(
+        self,
+        global_state_dim: int,
+        self_dim: int,
+        candidate_dim: int,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.candidate_encoder = nn.Sequential(
+            nn.Linear(candidate_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(global_state_dim + self_dim + hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        global_state: torch.Tensor,
+        self_state: torch.Tensor,
+        candidates: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if global_state.dim() == 1:
+            global_state = global_state.unsqueeze(0)
+        if self_state.dim() == 1:
+            self_state = self_state.unsqueeze(0)
+        if candidates.dim() == 2:
+            candidates = candidates.unsqueeze(0)
+        if candidate_mask.dim() == 1:
+            candidate_mask = candidate_mask.unsqueeze(0)
+
+        mask = candidate_mask.to(device=candidates.device, dtype=torch.bool)
+        if not torch.all(mask.any(dim=-1)):
+            raise ValueError('Low Critic 的每个样本至少需要一个合法候选')
+        encoded = self.candidate_encoder(candidates)
+        expanded_mask = mask.unsqueeze(-1)
+        count = expanded_mask.sum(dim=1).clamp_min(1).to(encoded.dtype)
+        pooled_mean = (encoded * expanded_mask).sum(dim=1) / count
+        dtype_min = torch.finfo(encoded.dtype).min
+        pooled_max = encoded.masked_fill(~expanded_mask, dtype_min).max(dim=1).values
+        value_input = torch.cat(
+            (global_state, self_state, pooled_mean, pooled_max), dim=-1
+        )
+        return self.value_head(value_input).squeeze(-1)
+
+
 class MCSMAPPOAgent:
-    """MCS-only High/Low actors, centralized critic, and their optimizers."""
+    """MCS High/Low Actor、双 Critic 及完全独立的优化器。"""
+
+    CHECKPOINT_VERSION = 3
 
     def __init__(
         self,
@@ -153,6 +216,8 @@ class MCSMAPPOAgent:
         hidden_dim: int = 128,
         actor_lr: float = 3e-4,
         critic_lr: float = 1e-3,
+        low_actor_lr: float | None = None,
+        low_critic_lr: float | None = None,
         device: str = "cpu",
     ):
         self.device = torch.device(device)
@@ -160,40 +225,105 @@ class MCSMAPPOAgent:
         self.low_actor = MCSLowActor(
             low_self_dim, low_candidate_dim, hidden_dim
         ).to(self.device)
-        self.critic = CentralizedCritic(critic_state_dim, hidden_dim).to(self.device)
+        global_state_dim = critic_state_dim - high_state_dim
+        if global_state_dim <= 0:
+            raise ValueError('critic_state_dim 必须大于 high_state_dim')
+        self.high_critic = CentralizedCritic(
+            critic_state_dim, hidden_dim
+        ).to(self.device)
+        self.low_critic = LowCentralizedCritic(
+            global_state_dim,
+            low_self_dim,
+            low_candidate_dim,
+            hidden_dim,
+        ).to(self.device)
         self.high_optimizer = torch.optim.Adam(
             self.high_actor.parameters(), lr=actor_lr
         )
         self.low_optimizer = torch.optim.Adam(
-            self.low_actor.parameters(), lr=actor_lr
+            self.low_actor.parameters(), lr=(low_actor_lr or actor_lr)
         )
-        self.critic_optimizer = torch.optim.Adam(
-            self.critic.parameters(), lr=critic_lr
+        self.high_critic_optimizer = torch.optim.Adam(
+            self.high_critic.parameters(), lr=critic_lr
         )
+        self.low_critic_optimizer = torch.optim.Adam(
+            self.low_critic.parameters(), lr=(low_critic_lr or critic_lr)
+        )
+        self.last_load_info: Dict = {}
 
     def train(self) -> None:
         self.high_actor.train()
         self.low_actor.train()
-        self.critic.train()
+        self.high_critic.train()
+        self.low_critic.train()
 
     def eval(self) -> None:
         self.high_actor.eval()
         self.low_actor.eval()
-        self.critic.eval()
+        self.high_critic.eval()
+        self.low_critic.eval()
 
     def _tensor(self, value: TensorLike, dtype=torch.float32) -> torch.Tensor:
         return torch.as_tensor(value, dtype=dtype, device=self.device)
 
+    def _load_high_actor_state_dict(self, state_dict: Dict) -> bool:
+        """加载两动作High头，并兼容旧三动作Serve/Recharge/Wait权重。
+
+        旧模型最后一层的前两行恰好对应 Serve/Recharge，因此只裁掉 Wait
+        输出行；其余共享表征参数原样迁移。返回值表示是否发生了该迁移。
+        """
+        current_state = self.high_actor.state_dict()
+        adapted_state = dict(state_dict)
+        migrated_wait_head = False
+        for name, target in current_state.items():
+            source = adapted_state.get(name)
+            if source is None or tuple(source.shape) == tuple(target.shape):
+                continue
+            if (
+                source.ndim >= 1
+                and source.shape[0] == 3
+                and target.shape[0] == 2
+                and tuple(source.shape[1:]) == tuple(target.shape[1:])
+            ):
+                adapted_state[name] = source[:2].clone()
+                migrated_wait_head = True
+                continue
+            raise RuntimeError(
+                f'High Actor参数{name}形状不兼容：'
+                f'{tuple(source.shape)} -> {tuple(target.shape)}'
+            )
+        self.high_actor.load_state_dict(adapted_state)
+        return migrated_wait_head
+
     @torch.no_grad()
-    def get_values_batch(self, critic_states: TensorLike) -> np.ndarray:
+    def get_high_values_batch(self, critic_states: TensorLike) -> np.ndarray:
         states = self._tensor(critic_states)
         if states.dim() == 1:
             states = states.unsqueeze(0)
-        return self.critic(states).detach().cpu().numpy()
+        return self.high_critic(states).detach().cpu().numpy()
+
+    # 兼容旧推理/测试调用方；语义明确等同于 High Critic。
+    get_values_batch = get_high_values_batch
 
     @torch.no_grad()
     def get_value(self, critic_state: TensorLike) -> float:
-        return float(self.get_values_batch(critic_state)[0])
+        return float(self.get_high_values_batch(critic_state)[0])
+
+    @torch.no_grad()
+    def get_low_values_batch(
+        self,
+        global_states: TensorLike,
+        self_states: TensorLike,
+        candidates: TensorLike,
+        masks: TensorLike,
+    ) -> np.ndarray:
+        values = self.low_critic(
+            self._tensor(global_states),
+            self._tensor(self_states),
+            self._tensor(candidates),
+            self._tensor(masks, dtype=torch.bool),
+        )
+        return values.detach().cpu().numpy()
 
     @torch.no_grad()
     def select_mcs_actions_batch(self, observations: list[Dict]) -> list[Dict]:
@@ -283,31 +413,138 @@ class MCSMAPPOAgent:
         actions = actions.to(self.device)
         return distribution.log_prob(actions), distribution.entropy()
 
-    def values(self, critic_states: torch.Tensor) -> torch.Tensor:
-        return self.critic(critic_states.to(self.device))
+    def high_values(self, critic_states: torch.Tensor) -> torch.Tensor:
+        return self.high_critic(critic_states.to(self.device))
+
+    # 兼容旧训练辅助代码；新训练必须显式调用 high_values/low_values。
+    values = high_values
+
+    def low_values(
+        self,
+        global_states: torch.Tensor,
+        self_states: torch.Tensor,
+        candidates: torch.Tensor,
+        masks: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.low_critic(
+            global_states.to(self.device),
+            self_states.to(self.device),
+            candidates.to(self.device),
+            masks.to(self.device),
+        )
 
     def save(self, path: Union[str, Path], metadata: Dict | None = None) -> None:
         checkpoint = {
+            "checkpoint_version": self.CHECKPOINT_VERSION,
+            "high_action_names": MCS_ACTION_NAMES,
             "high_actor": self.high_actor.state_dict(),
             "low_actor": self.low_actor.state_dict(),
-            "critic": self.critic.state_dict(),
+            "high_critic": self.high_critic.state_dict(),
+            "low_critic": self.low_critic.state_dict(),
             "high_optimizer": self.high_optimizer.state_dict(),
             "low_optimizer": self.low_optimizer.state_dict(),
-            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "high_critic_optimizer": self.high_critic_optimizer.state_dict(),
+            "low_critic_optimizer": self.low_critic_optimizer.state_dict(),
             "metadata": metadata or {},
         }
         torch.save(checkpoint, Path(path))
 
-    def load(self, path: Union[str, Path]) -> Dict:
+    def load_high_branch(
+        self,
+        path: Union[str, Path],
+        load_high_critic: bool = True,
+        freeze: bool = True,
+    ) -> Dict:
+        """只迁移 High 分支，保持 Low Actor/Critic 为当前随机初始化。
+
+        该入口用于 V6 的固定 High 消融训练。旧 V5 ``critic`` 与当前
+        High Critic 结构兼容，因此可作为只读诊断价值函数加载；High 的
+        optimizer 状态不会恢复，避免误以为后续仍会继续训练 High。
+        """
         checkpoint = torch.load(
             Path(path), map_location=self.device, weights_only=False
         )
-        self.high_actor.load_state_dict(checkpoint["high_actor"])
+        migrated_wait_head = self._load_high_actor_state_dict(
+            checkpoint['high_actor']
+        )
+        high_critic_loaded = False
+        if load_high_critic:
+            if 'high_critic' in checkpoint:
+                self.high_critic.load_state_dict(checkpoint['high_critic'])
+                high_critic_loaded = True
+            elif 'critic' in checkpoint:
+                self.high_critic.load_state_dict(checkpoint['critic'])
+                high_critic_loaded = True
+        if freeze:
+            for parameter in self.high_actor.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.high_critic.parameters():
+                parameter.requires_grad_(False)
+            self.high_actor.eval()
+            self.high_critic.eval()
+        self.last_load_info = {
+            'high_branch_only': True,
+            'source_checkpoint_version': int(
+                checkpoint.get('checkpoint_version', 1)
+            ),
+            'high_actor_loaded': True,
+            'migrated_high_wait_head': migrated_wait_head,
+            'high_critic_loaded': high_critic_loaded,
+            'high_frozen': bool(freeze),
+            'low_actor_initialized_fresh': True,
+            'low_critic_initialized_fresh': True,
+            'optimizers_loaded': False,
+        }
+        return checkpoint.get('metadata', {})
+
+    def load(
+        self,
+        path: Union[str, Path],
+        load_optimizers: bool = False,
+    ) -> Dict:
+        """加载新旧 checkpoint。
+
+        V5 旧格式的 ``critic`` 仅迁移到 High Critic；Low Critic 保持新
+        初始化。优化器默认不恢复，避免旧单 Critic optimizer 与新结构
+        不兼容；只有当前V3两动作checkpoint才恢复optimizer。旧三动作High
+        输出头会自动保留Serve/Recharge两行并裁掉Wait行。
+        """
+        checkpoint = torch.load(
+            Path(path), map_location=self.device, weights_only=False
+        )
+        migrated_wait_head = self._load_high_actor_state_dict(
+            checkpoint["high_actor"]
+        )
         self.low_actor.load_state_dict(checkpoint["low_actor"])
-        self.critic.load_state_dict(checkpoint["critic"])
-        self.high_optimizer.load_state_dict(checkpoint["high_optimizer"])
-        self.low_optimizer.load_state_dict(checkpoint["low_optimizer"])
-        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+        version = int(checkpoint.get('checkpoint_version', 1))
+        migrated_from_v5 = version < self.CHECKPOINT_VERSION
+        if 'high_critic' in checkpoint:
+            self.high_critic.load_state_dict(checkpoint['high_critic'])
+        elif 'critic' in checkpoint:
+            self.high_critic.load_state_dict(checkpoint['critic'])
+        else:
+            raise KeyError('checkpoint 缺少 high_critic/critic 参数')
+        if 'low_critic' in checkpoint:
+            self.low_critic.load_state_dict(checkpoint['low_critic'])
+
+        optimizers_loaded = False
+        if load_optimizers and version >= self.CHECKPOINT_VERSION:
+            self.high_optimizer.load_state_dict(checkpoint['high_optimizer'])
+            self.low_optimizer.load_state_dict(checkpoint['low_optimizer'])
+            self.high_critic_optimizer.load_state_dict(
+                checkpoint['high_critic_optimizer']
+            )
+            self.low_critic_optimizer.load_state_dict(
+                checkpoint['low_critic_optimizer']
+            )
+            optimizers_loaded = True
+        self.last_load_info = {
+            'checkpoint_version': version,
+            'migrated_from_v5': migrated_from_v5,
+            'low_critic_initialized_fresh': 'low_critic' not in checkpoint,
+            'optimizers_loaded': optimizers_loaded,
+            'migrated_high_wait_head': migrated_wait_head,
+        }
         return checkpoint.get("metadata", {})
 
 

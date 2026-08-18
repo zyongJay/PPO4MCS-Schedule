@@ -51,6 +51,7 @@ from core import EV, MCS
 from environment import MultiAgentEnv
 from matching import RechargeMatcher
 from network import MCSMAPPOAgent, MCS_ACTION_NAMES
+from observation import MCS_STAY_CANDIDATE_ID
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -315,23 +316,31 @@ class RLDecisionPolicy(DecisionPolicy):
                         if matched else list(actor.pos)
                     ),
                 })
-            elif action['mode'] == 'Wait':
-                action_n.append({
-                    'mode': 'Wait',
-                    'requested_mode': 'Wait',
-                    'recharge_matched': False,
-                    'target_pos': list(actor.pos),
-                })
             else:
                 candidate_id = int(
                     observation['candidate_ids'][action['low_action']]
                 )
-                target = ev_by_id[candidate_id]
+                low_stay_selected = candidate_id == MCS_STAY_CANDIDATE_ID
+                has_quasi_candidate = bool(
+                    observation.get('quasi_candidate_count', 0) > 0
+                )
+                target_pos = (
+                    list(actor.pos)
+                    if low_stay_selected
+                    else list(ev_by_id[candidate_id].pos)
+                )
                 action_n.append({
                     'mode': 'Serve',
                     'requested_mode': 'Serve',
                     'recharge_matched': False,
-                    'target_pos': list(target.pos),
+                    'high_action_mask': observation['high_action_mask'].tolist(),
+                    'target_pos': target_pos,
+                    'low_candidate_id': candidate_id,
+                    'low_stay_selected': low_stay_selected,
+                    'low_forced_stay': bool(
+                        low_stay_selected and not has_quasi_candidate
+                    ),
+                    'has_quasi_candidate': has_quasi_candidate,
                 })
         return action_n
 

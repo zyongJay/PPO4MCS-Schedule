@@ -122,6 +122,14 @@ class EV:
         self.charge_provider = None
         self.charge_provider_id = -1
         self.charge_provider_type = ""  # "MCS" 或 "FCS"
+        # 固化产生本次 MCS 服务的 Low Serve 决策，供延迟事件精确归因。
+        self.service_low_decision_id = -1
+        self.service_serve_option_id = -1
+        # 匹配阶段基于同一物理约束矩阵计算的 FCS 可替代性代理。
+        self.service_marginal_weight = 0.0
+        self.low_service_marginal_weight = 0.0
+        self.feasible_mcs_count = 0
+        self.feasible_fcs_slot_count = 0
         self.charge_power_kwh = 0.0  # 计划充电量
         self.charge_time_remain_min = 0.0  # 剩余充电时间
 
@@ -151,7 +159,8 @@ class EV:
         if self.remain < EV_LOW_POWER_THRESHOLD:
             if self.need_charge:  # 如果电车原来就在需要充电的状态
                 self.wait_time_steps += 1
-                if self.wait_time_steps > MAX_WAIT_TIME_STEPS:
+                self.total_wait_time_min += STEP_DURATION_MIN
+                if self.wait_time_steps > MAX_WAIT_TIME_STEPS or self.remain < EV_LOWEST_POWER:
                     self.fail_charge = True  # 超时失败
                     self.need_charge = False
 
@@ -251,6 +260,12 @@ class EV:
         self.charge_provider = None
         self.charge_provider_id = -1
         self.charge_provider_type = ""  # "MCS" 或 "FCS"
+        self.service_low_decision_id = -1
+        self.service_serve_option_id = -1
+        self.service_marginal_weight = 0.0
+        self.low_service_marginal_weight = 0.0
+        self.feasible_mcs_count = 0
+        self.feasible_fcs_slot_count = 0
         self.charge_power_kwh = 0.0  # 计划充电量
         self.charge_time_remain_min = 0.0  # 剩余充电时间
 
@@ -311,6 +326,9 @@ class MCS:
         self.is_idle = True
         self.is_recharging = False
         self.is_broken = False
+        # energy-stranded 与 broken 同属永久失去后续服务能力的终止状态。
+        # 前者表示车辆未物理损坏，但剩余电量已无法到达任何 FCS。
+        self.is_energy_stranded = False
         self.last_pos = list(pos)
         self.reward = 0
 
@@ -342,6 +360,12 @@ class MCS:
         self.total_idle_time_min = 0.0
         # 连续主动 Wait 的环境 step 数；forced Wait 不累计。
         self.consecutive_voluntary_wait_steps = 0
+        # 当前仍在生效的 Low Serve 空间决策。任务结束时暂不清除，避免
+        # 同一 step 自动再匹配时丢失归因；下一次显式 High 决策会覆写。
+        self.active_low_decision_id = -1
+        self.active_serve_option_id = -1
+        self.active_low_candidate_id = -1
+        self.active_low_started_step = -1
 
     # 注入任务信息    MCS-IEV充电 / MCS-FCS补电共用
     def set_target(self, obj, target_type: str, target_id: int,
@@ -442,6 +466,7 @@ class MCS:
         self.is_idle = True
         self.is_recharging = False
         self.is_broken = False
+        self.is_energy_stranded = False
         self.last_pos = list(pos)
         self.reward = 0
 
@@ -472,6 +497,10 @@ class MCS:
         self.total_reward = 0.0
         self.total_idle_time_min = 0.0
         self.consecutive_voluntary_wait_steps = 0
+        self.active_low_decision_id = -1
+        self.active_serve_option_id = -1
+        self.active_low_candidate_id = -1
+        self.active_low_started_step = -1
 
     def step_finish(self):
         self.last_pos = self.pos
@@ -485,7 +514,12 @@ class MCS:
     # 属性
     @property
     def is_task(self) -> bool:
-        return not self.is_idle and not self.is_recharging and not self.is_broken
+        return (
+            not self.is_idle
+            and not self.is_recharging
+            and not self.is_broken
+            and not self.is_energy_stranded
+        )
 
 
 class FCS:
@@ -590,24 +624,25 @@ class FCS:
         for idx in range(self.num_slots):
             if self.slot_states[idx] != SlotState.OCCUPIED or self.slot_target[idx] is None:
                 continue
+            charge_speed = CHARGE_SPEED_PER_MIN if isinstance(self.slot_target[idx], EV) else RECHARGE_SPEED_PER_MIN
             if not self.slot_target[idx].is_arrive:
                 rest_time = move_toward_target(self.slot_target[idx], self.pos)
                 if self.slot_target[idx].is_arrive and rest_time > 0:
                     if self.slot_charge_remain_min[idx] > rest_time:
                         # 充电信息更新
                         self.slot_charge_remain_min[idx] -= rest_time
-                        self.slot_charge_remain_kwh[idx] -= rest_time * CHARGE_SPEED_PER_MIN
+                        self.slot_charge_remain_kwh[idx] -= rest_time * charge_speed
                         self.slot_target[idx].charge_time_remain_min -= rest_time
-                        self.slot_target[idx].charge_power_kwh -= rest_time * CHARGE_SPEED_PER_MIN
+                        self.slot_target[idx].charge_power_kwh -= rest_time * charge_speed
                         # 实际电量转移
-                        self.slot_target[idx].remain += rest_time * CHARGE_SPEED_PER_MIN
+                        self.slot_target[idx].remain += rest_time * charge_speed
                     else:
                         self.slot_target[idx].remain += self.slot_charge_remain_kwh[idx]
                         self.slot_target[idx].finish_charging()
                         self.release_slot(idx)
             else:
                 charge_min = min(STEP_DURATION_MIN, self.slot_charge_remain_min[idx])
-                charged = CHARGE_SPEED_PER_MIN * charge_min
+                charged = charge_speed * charge_min
                 self.slot_charge_remain_min[idx] -= charge_min
                 self.slot_charge_remain_kwh[idx] -= charged
                 self.slot_target[idx].charge_time_remain_min -= charge_min

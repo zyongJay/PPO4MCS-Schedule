@@ -139,10 +139,12 @@ def check_hard_constraints(ev: EV, r_type: str, r_obj):
 
     charge_pos = [(ev.pos[0] + r_obj.pos[0]) / 2.0, (ev.pos[1] + r_obj.pos[1]) / 2.0] if r_type == "MCS" else list(
         r_obj.pos)
+    now_track_pos = ev.track[ev.track_index]
     next_track_pos = ev.track[ev.track_index + 1] if ev.track_index < len(ev.track) - 1 else ev.track[-1]
     detour_dist_km = (euclidean_distance(ev.pos[0], ev.pos[1], charge_pos[0], charge_pos[1])
                       + euclidean_distance(charge_pos[0], charge_pos[1], next_track_pos[0], next_track_pos[1])
-                      - euclidean_distance(ev.pos[0], ev.pos[1], next_track_pos[0], next_track_pos[1])
+                      # - euclidean_distance(ev.pos[0], ev.pos[1], next_track_pos[0], next_track_pos[1])
+                      - euclidean_distance(now_track_pos[0], now_track_pos[1], next_track_pos[0], next_track_pos[1])
                       ) / 1000.0
     if r_type == 'MCS':
         # EV 到中点距离 = dist / 2
@@ -196,7 +198,12 @@ class ImmediateMatcher:
         resources = []  # List[(type, provider_obj)]
 
         for mcs in all_mcss:
-            if mcs.is_idle and not mcs.is_recharging and not mcs.is_broken:
+            if (
+                mcs.is_idle
+                and not mcs.is_recharging
+                and not mcs.is_broken
+                and not getattr(mcs, 'is_energy_stranded', False)
+            ):
                 resources.append(('MCS', mcs))
 
         for fcs in all_fcss:
@@ -224,6 +231,16 @@ class ImmediateMatcher:
             # 充电双方对象
             ev = iev_set[iev_idx]
             r_type, r_obj = resources[res_idx]
+            # 使用与正式匹配完全相同的 hard-constraint validity 矩阵统计
+            # 可替代资源，作为系统边际价值代理，避免仅凭距离臆测。
+            feasible_mcs_count = sum(
+                bool(validity[iev_idx, index]) and resource_type == 'MCS'
+                for index, (resource_type, _resource) in enumerate(resources)
+            )
+            feasible_fcs_slot_count = sum(
+                bool(validity[iev_idx, index]) and resource_type == 'FCS'
+                for index, (resource_type, _resource) in enumerate(resources)
+            )
             charge_pos = [(ev.pos[0] + r_obj.pos[0]) / 2.0,
                           (ev.pos[1] + r_obj.pos[1]) / 2.0] if r_type == "MCS" else list(r_obj.pos)
             detour_dist_km = float(detour[iev_idx, res_idx])
@@ -268,13 +285,28 @@ class ImmediateMatcher:
                 'charge_power': charge_power,
                 'charge_time': charge_time_min,
                 'cost_score': float(cost[iev_idx, res_idx]),
+                'feasible_mcs_count': int(feasible_mcs_count),
+                'feasible_fcs_slot_count': int(feasible_fcs_slot_count),
             })
             matched_iev_indices.add(iev_idx)
 
         # ── 未匹配的 IEV ──
         for i, ev in enumerate(iev_set):
             if i not in matched_iev_indices:
-                results.append({'ev_id': ev.id, 'success': False})
+                results.append({
+                    'ev_id': ev.id,
+                    'success': False,
+                    'feasible_mcs_count': int(sum(
+                        bool(validity[i, index]) and resource_type == 'MCS'
+                        for index, (resource_type, _resource)
+                        in enumerate(resources)
+                    )),
+                    'feasible_fcs_slot_count': int(sum(
+                        bool(validity[i, index]) and resource_type == 'FCS'
+                        for index, (resource_type, _resource)
+                        in enumerate(resources)
+                    )),
+                })
 
         return results
 
@@ -308,6 +340,7 @@ class ImmediateMatcher:
         dist_norm = dist_km / max(COMM_RANGE, 1.0)
 
         if r_type == 'MCS':
+            dist_norm /= 2      # 充电位置是二者中间
             reliability = 1.0 - r_obj.remain * 1.0 / MCS_BATTERY_CAPACITY
         else:
             reliability = 1.0 - r_obj.available_slots * 1.0 / max(1, r_obj.capacity)
@@ -379,7 +412,7 @@ class RechargeMatcher:
             charge_power = mcs_charge_info[mcs_idx]
             charge_power += euclidean_distance(mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]) / 1000.0 * POWER_UNIT
             charge_power = min(charge_power, MAX_RECHARGE_PER_SESSION_KWH)
-            charge_time_min = charge_power / CHARGE_SPEED_PER_MIN
+            charge_time_min = charge_power / RECHARGE_SPEED_PER_MIN
 
             mcs.set_target(
                 obj=fcs,
@@ -421,20 +454,35 @@ class RechargeMatcher:
         cost = np.full((n_mcs, n_res), 1e9, dtype=np.float64)
         validity = np.zeros((n_mcs, n_res), dtype=bool)
 
+        # Recharge 是全图规划，距离归一化使用本轮候选中的最大距离；
+        # COMM_RANGE 不再作为硬约束。
+        distance_scale_km = max((
+            euclidean_distance(
+                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
+            ) / 1000.0
+            for mcs in mcs_list
+            for fcs in resources
+        ), default=1.0)
+
         for i, mcs in enumerate(mcs_list):
+            if (
+                mcs.is_broken
+                or getattr(mcs, 'is_energy_stranded', False)
+                or mcs.is_recharging
+                or not mcs.is_idle
+            ):
+                continue
             for j, fcs in enumerate(resources):
                 dist_km = euclidean_distance(mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]) / 1000.0
 
                 # 硬性约束
-                if dist_km > COMM_RANGE:
-                    continue
                 energy_to_fcs = dist_km * POWER_UNIT
-                if mcs.remain < energy_to_fcs:
+                if float(mcs.remain) + 1e-12 < energy_to_fcs:
                     continue
 
                 validity[i, j] = True
 
-                dist_norm = dist_km / max(COMM_RANGE, 1.0)
+                dist_norm = dist_km / max(distance_scale_km, 1e-8)
                 reliability = 1.0 - fcs.available_slots * 1.0 / max(1, fcs.capacity)
                 cost[i, j] = self.w_dist * dist_norm + self.w_reliability * reliability
 

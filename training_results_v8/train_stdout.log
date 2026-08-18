@@ -1,0 +1,43 @@
+device=cuda cuda_name=NVIDIA GeForce RTX 3050 Laptop GPU episodes_per_update=8 minibatch=1024
+update=1 episodes=1-8 samples=13443 avg_reward=0.0469 actor_loss=-0.0264 critic_loss=0.3300 cuda_peak_mb=40.0
+update=2 episodes=9-16 samples=13937 avg_reward=0.0507 actor_loss=-0.0150 critic_loss=0.2870 cuda_peak_mb=55.2
+update=3 episodes=17-24 samples=13717 avg_reward=0.0663 actor_loss=-0.0113 critic_loss=0.2918 cuda_peak_mb=57.2
+update=4 episodes=25-32 samples=13934 avg_reward=0.0682 actor_loss=-0.0222 critic_loss=0.2727 cuda_peak_mb=61.4
+update=5 episodes=33-40 samples=13977 avg_reward=0.0805 actor_loss=-0.0151 critic_loss=0.2451 cuda_peak_mb=62.8
+update=6 episodes=41-48 samples=14942 avg_reward=0.0731 actor_loss=-0.0083 critic_loss=0.1663 cuda_peak_mb=67.8
+update=7 episodes=49-56 samples=15427 avg_reward=0.0774 actor_loss=-0.0116 critic_loss=0.1647 cuda_peak_mb=70.7
+update=8 episodes=57-64 samples=15641 avg_reward=0.0735 actor_loss=-0.0082 critic_loss=0.1380 cuda_peak_mb=71.5
+update=9 episodes=65-72 samples=15672 avg_reward=0.0738 actor_loss=-0.0077 critic_loss=0.1438 cuda_peak_mb=71.9
+update=10 episodes=73-80 samples=15452 avg_reward=0.0831 actor_loss=-0.0067 critic_loss=0.1758 cuda_peak_mb=71.9
+update=11 episodes=81-88 samples=15800 avg_reward=0.0783 actor_loss=-0.0041 critic_loss=0.1491 cuda_peak_mb=73.9
+update=12 episodes=89-96 samples=15954 avg_reward=0.0849 actor_loss=-0.0068 critic_loss=0.1775 cuda_peak_mb=74.5
+update=13 episodes=97-104 samples=15706 avg_reward=0.0894 actor_loss=-0.0061 critic_loss=0.2040 cuda_peak_mb=73.9
+update=14 episodes=105-112 samples=15532 avg_reward=0.0779 actor_loss=-0.0030 critic_loss=0.1853 cuda_peak_mb=72.5
+update=15 episodes=113-120 samples=15917 avg_reward=0.0838 actor_loss=-0.0009 critic_loss=0.1553 cuda_peak_mb=74.2
+update=16 episodes=121-128 samples=16093 avg_reward=0.0737 actor_loss=-0.0059 critic_loss=0.1640 cuda_peak_mb=74.5
+update=17 episodes=129-136 samples=15229 avg_reward=0.0877 actor_loss=-0.0034 critic_loss=0.1945 cuda_peak_mb=71.8
+update=18 episodes=137-144 samples=15471 avg_reward=0.0864 actor_loss=-0.0034 critic_loss=0.1951 cuda_peak_mb=72.6
+update=19 episodes=145-152 samples=15167 avg_reward=0.0852 actor_loss=-0.0001 critic_loss=0.1831 cuda_peak_mb=71.5
+update=20 episodes=153-160 samples=16243 avg_reward=0.0774 actor_loss=-0.0071 critic_loss=0.1338 cuda_peak_mb=76.8
+update=21 episodes=161-168 samples=16149 avg_reward=0.0863 actor_loss=0.0011 critic_loss=0.1617 cuda_peak_mb=76.7
+update=22 episodes=169-176 samples=15746 avg_reward=0.0862 actor_loss=-0.0022 critic_loss=0.1597 cuda_peak_mb=74.2
+update=23 episodes=177-184 samples=16140 avg_reward=0.0808 actor_loss=0.0045 critic_loss=0.1505 cuda_peak_mb=76.6
+update=24 episodes=185-192 samples=15729 avg_reward=0.0866 actor_loss=-0.0005 critic_loss=0.1538 cuda_peak_mb=74.2
+update=25 episodes=193-200 samples=15766 avg_reward=0.0878 actor_loss=-0.0013 critic_loss=0.1879 cuda_peak_mb=74.3
+update=26 episodes=201-208 samples=16023 avg_reward=0.0813 actor_loss=-0.0036 critic_loss=0.1647 cuda_peak_mb=74.2
+update=27 episodes=209-216 samples=16587 avg_reward=0.0796 actor_loss=-0.0035 critic_loss=0.1327 cuda_peak_mb=77.1
+update=28 episodes=217-224 samples=15907 avg_reward=0.0839 actor_loss=-0.0036 critic_loss=0.1644 cuda_peak_mb=74.3
+update=29 episodes=225-232 samples=15761 avg_reward=0.0865 actor_loss=-0.0029 critic_loss=0.1744 cuda_peak_mb=74.4
+update=30 episodes=233-240 samples=16427 avg_reward=0.0841 actor_loss=-0.0031 critic_loss=0.1441 cuda_peak_mb=76.9
+update=31 episodes=241-248 samples=15827 avg_reward=0.0897 actor_loss=-0.0007 critic_loss=0.1621 cuda_peak_mb=74.5
+update=32 episodes=249-256 samples=15738 avg_reward=0.0856 actor_loss=-0.0003 critic_loss=0.1769 cuda_peak_mb=74.3
+update=33 episodes=257-264 samples=15860 avg_reward=0.0767 actor_loss=0.0019 critic_loss=0.1501 cuda_peak_mb=73.9
+update=34 episodes=265-272 samples=16502 avg_reward=0.0792 actor_loss=0.0007 critic_loss=0.1438 cuda_peak_mb=77.0
+update=35 episodes=273-280 samples=15983 avg_reward=0.0825 actor_loss=-0.0053 critic_loss=0.1409 cuda_peak_mb=74.2
+update=36 episodes=281-288 samples=15901 avg_reward=0.0863 actor_loss=-0.0053 critic_loss=0.1713 cuda_peak_mb=74.1
+update=37 episodes=289-296 samples=16136 avg_reward=0.0785 actor_loss=0.0017 critic_loss=0.1621 cuda_peak_mb=76.7
+update=38 episodes=297-300 samples=8393 avg_reward=0.0807 actor_loss=-0.0028 critic_loss=0.1104 cuda_peak_mb=47.8
+training log: D:\Exp_MCSs\PPO\training_results_v8\training_log.csv
+high option rollout: D:\Exp_MCSs\PPO\training_results_v8\high_option_rollout.csv
+low option rollout: D:\Exp_MCSs\PPO\training_results_v8\low_option_rollout.csv
+convergence curves: D:\Exp_MCSs\PPO\training_results_v8\convergence_curves.png
