@@ -11,6 +11,7 @@ import torch
 
 @dataclass
 class OpenHighOption:
+    option_id: int
     mcs_id: int
     high_state: np.ndarray
     high_mask: np.ndarray
@@ -19,13 +20,24 @@ class OpenHighOption:
     critic_state: np.ndarray
     value: float
     recharge_matched: bool
+    start_remain_kwh: float = 0.0
+    start_serve_potential: float = 0.0
+    task_started: bool = False
+    consecutive_no_candidate_replans: int = 0
     discounted_reward: float = 0.0
     reward_discount: float = 1.0
     duration_steps: int = 0
+    boundary_reward: float = 0.0
+    termination_reward: float = 0.0
+    recharge_option_reward: float = 0.0
+    recharge_risk_delta: float = 0.0
+    option_event_reward: float = 0.0
+    delayed_option_event_reward: float = 0.0
 
 
 @dataclass
 class HighOptionTransition:
+    option_id: int
     mcs_id: int
     high_state: np.ndarray
     high_mask: np.ndarray
@@ -40,6 +52,16 @@ class HighOptionTransition:
     terminal: bool
     truncated: bool
     recharge_matched: bool
+    termination_reason: str
+    start_remain_kwh: float = 0.0
+    start_serve_potential: float = 0.0
+    end_remain_kwh: float = 0.0
+    boundary_reward: float = 0.0
+    termination_reward: float = 0.0
+    recharge_option_reward: float = 0.0
+    recharge_risk_delta: float = 0.0
+    option_event_reward: float = 0.0
+    delayed_option_event_reward: float = 0.0
     advantage: float = 0.0
     return_target: float = 0.0
 
@@ -52,21 +74,27 @@ class HighOptionRolloutBuffer:
         self.gae_lambda = float(gae_lambda)
         self.open_options: Dict[int, OpenHighOption] = {}
         self.transitions: List[HighOptionTransition] = []
+        self._transition_by_option_id: Dict[int, HighOptionTransition] = {}
+        self.delayed_event_count = 0
         self._returns_ready = False
 
     def start_option(
         self,
+        option_id: int,
         mcs_id: int,
         observation: Dict,
         action: Dict,
         critic_state: np.ndarray,
         value: float,
         recharge_matched: bool,
+        start_remain_kwh: float | None = None,
+        start_serve_potential: float = 0.0,
     ) -> None:
         if mcs_id in self.open_options:
             raise RuntimeError(f'MCS {mcs_id} 已有未关闭的 High option')
         self._returns_ready = False
         self.open_options[mcs_id] = OpenHighOption(
+            option_id=int(option_id),
             mcs_id=int(mcs_id),
             high_state=np.asarray(observation['high_state'], dtype=np.float32).copy(),
             high_mask=np.asarray(observation['high_action_mask'], dtype=bool).copy(),
@@ -75,7 +103,43 @@ class HighOptionRolloutBuffer:
             critic_state=np.asarray(critic_state, dtype=np.float32).copy(),
             value=float(value),
             recharge_matched=bool(recharge_matched),
+            start_remain_kwh=float(
+                0.0 if start_remain_kwh is None else start_remain_kwh
+            ),
+            start_serve_potential=float(np.clip(
+                start_serve_potential, 0.0, 1.0
+            )),
         )
+
+    def mode(self, mcs_id: int) -> str:
+        option = self.open_options[int(mcs_id)]
+        return 'Serve' if option.high_action == 0 else 'Recharge'
+
+    def option_id(self, mcs_id: int) -> int:
+        return int(self.open_options[int(mcs_id)].option_id)
+
+    def record_low_replan(
+        self, mcs_id: int, has_quasi_candidate: bool
+    ) -> None:
+        option = self.open_options[int(mcs_id)]
+        if option.high_action != 0:
+            raise RuntimeError('Recharge option 不能记录 Low 重规划')
+        if has_quasi_candidate:
+            option.consecutive_no_candidate_replans = 0
+        else:
+            option.consecutive_no_candidate_replans += 1
+
+    def mark_task_started(self, mcs_ids: Iterable[int]) -> None:
+        for mcs_id in mcs_ids:
+            option = self.open_options.get(int(mcs_id))
+            if option is not None and option.high_action == 0:
+                option.task_started = True
+
+    def mark_recharge_matched(self, mcs_ids: Iterable[int]) -> None:
+        for mcs_id in mcs_ids:
+            option = self.open_options.get(int(mcs_id))
+            if option is not None and option.high_action == 1:
+                option.recharge_matched = True
 
     def add_step_rewards(self, reward_by_mcs_id: Dict[int, float]) -> None:
         self._returns_ready = False
@@ -85,18 +149,86 @@ class HighOptionRolloutBuffer:
             option.reward_discount *= self.gamma
             option.duration_steps += 1
 
+    def add_option_event_rewards(
+        self, reward_by_option_id: Dict[int, float]
+    ) -> None:
+        """按稳定 option_id 写入成功事件，支持关闭后的延迟回写。"""
+        self._returns_ready = False
+        open_by_option_id = {
+            option.option_id: option for option in self.open_options.values()
+        }
+        for raw_option_id, raw_reward in reward_by_option_id.items():
+            option_id = int(raw_option_id)
+            reward = float(raw_reward)
+            option = open_by_option_id.get(option_id)
+            if option is not None:
+                option.discounted_reward += option.reward_discount * reward
+                option.option_event_reward += reward
+                continue
+            transition = self._transition_by_option_id.get(option_id)
+            if transition is None:
+                raise RuntimeError(
+                    f'High reward 无对应 option_id={option_id}'
+                )
+            transition.option_reward += (
+                self.gamma ** transition.duration_steps
+            ) * reward
+            transition.option_event_reward += reward
+            transition.delayed_option_event_reward += reward
+            self.delayed_event_count += 1
+
+    def add_boundary_rewards(
+        self,
+        reward_by_mcs_id: Dict[int, float],
+        termination_reward_by_mcs_id: Dict[int, float] | None = None,
+        recharge_reward_by_mcs_id: Dict[int, float] | None = None,
+        recharge_risk_delta_by_mcs_id: Dict[int, float] | None = None,
+    ) -> None:
+        """在 Option 边界按 ``gamma ** duration`` 追加一次性奖励。"""
+        self._returns_ready = False
+        termination_rewards = termination_reward_by_mcs_id or {}
+        recharge_rewards = recharge_reward_by_mcs_id or {}
+        recharge_risk_deltas = recharge_risk_delta_by_mcs_id or {}
+        for raw_mcs_id, raw_reward in reward_by_mcs_id.items():
+            mcs_id = int(raw_mcs_id)
+            option = self.open_options.get(mcs_id)
+            if option is None:
+                raise RuntimeError(f'MCS {mcs_id} 没有可写入边界奖励的 High option')
+            reward = float(raw_reward)
+            option.discounted_reward += option.reward_discount * reward
+            option.boundary_reward += reward
+            option.termination_reward += float(
+                termination_rewards.get(mcs_id, 0.0)
+            )
+            option.recharge_option_reward += float(
+                recharge_rewards.get(mcs_id, 0.0)
+            )
+            option.recharge_risk_delta += float(
+                recharge_risk_deltas.get(mcs_id, 0.0)
+            )
+
     def close_options(
         self,
         decision_ready_ids: Iterable[int],
         next_critic_states: Dict[int, np.ndarray],
         next_values: Dict[int, float],
         terminal_ids: Iterable[int] = (),
+        termination_reasons: Dict[int, str] | None = None,
+        end_remain_by_mcs_id: Dict[int, float] | None = None,
         close_all: bool = False,
         truncated: bool = False,
     ) -> int:
         self._returns_ready = False
         ready = {int(value) for value in decision_ready_ids}
         terminal = {int(value) for value in terminal_ids}
+        reasons = {
+            int(key): str(value)
+            for key, value in (termination_reasons or {}).items()
+        }
+        end_remains = {
+            int(key): float(value)
+            for key, value in (end_remain_by_mcs_id or {}).items()
+        }
         close_ids = [
             mcs_id for mcs_id in self.open_options
             if close_all or mcs_id in ready or mcs_id in terminal
@@ -110,17 +242,13 @@ class HighOptionRolloutBuffer:
             elif mcs_id in next_critic_states and mcs_id in next_values:
                 bootstrap_value = float(next_values[mcs_id])
                 bootstrap_state = next_critic_states[mcs_id]
-            elif truncated:
-                # 忙碌 MCS 在截断点没有可构建的决策观测，显式采用零
-                # bootstrap，并用 truncated 字段区别于业务终止。
-                bootstrap_value = 0.0
-                bootstrap_state = np.zeros_like(option.critic_state)
             else:
                 if mcs_id not in next_critic_states or mcs_id not in next_values:
                     raise RuntimeError(f'MCS {mcs_id} 缺少 High bootstrap')
                 bootstrap_value = float(next_values[mcs_id])
                 bootstrap_state = next_critic_states[mcs_id]
-            self.transitions.append(HighOptionTransition(
+            transition = HighOptionTransition(
+                option_id=option.option_id,
                 mcs_id=option.mcs_id,
                 high_state=option.high_state,
                 high_mask=option.high_mask,
@@ -135,7 +263,28 @@ class HighOptionRolloutBuffer:
                 terminal=is_terminal,
                 truncated=bool(close_all and truncated),
                 recharge_matched=option.recharge_matched,
-            ))
+                termination_reason=reasons.get(
+                    mcs_id,
+                    'truncated' if close_all and truncated else (
+                        'terminal' if is_terminal else 'option_boundary'
+                    ),
+                ),
+                start_remain_kwh=option.start_remain_kwh,
+                start_serve_potential=option.start_serve_potential,
+                end_remain_kwh=end_remains.get(
+                    mcs_id, option.start_remain_kwh
+                ),
+                boundary_reward=option.boundary_reward,
+                termination_reward=option.termination_reward,
+                recharge_option_reward=option.recharge_option_reward,
+                recharge_risk_delta=option.recharge_risk_delta,
+                option_event_reward=option.option_event_reward,
+                delayed_option_event_reward=(
+                    option.delayed_option_event_reward
+                ),
+            )
+            self.transitions.append(transition)
+            self._transition_by_option_id[option.option_id] = transition
         return len(close_ids)
 
     def compute_returns_and_advantages(self) -> None:
@@ -164,6 +313,10 @@ class HighOptionRolloutBuffer:
         if not other._returns_ready:
             other.compute_returns_and_advantages()
         self.transitions.extend(other.transitions)
+        self._transition_by_option_id.update(
+            other._transition_by_option_id
+        )
+        self.delayed_event_count += other.delayed_event_count
         self._returns_ready = True
 
     def as_tensors(self, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -200,6 +353,7 @@ class HighOptionRolloutBuffer:
 @dataclass
 class OpenLowServeOption:
     decision_id: int
+    serve_option_id: int
     mcs_id: int
     low_self_state: np.ndarray
     low_candidates: np.ndarray
@@ -217,10 +371,12 @@ class OpenLowServeOption:
     selected_need_power_kwh: float
     selected_distance_ratio: float
     selected_attraction: float
+    selected_immediate_iev_attraction: float
     selected_mcs_competition: float
     selected_fcs_competition: float
     selected_desirability: float
     available_avg_attraction: float
+    available_avg_immediate_iev_attraction: float
     available_avg_mcs_competition: float
     available_avg_fcs_competition: float
     available_avg_desirability: float
@@ -235,6 +391,7 @@ class OpenLowServeOption:
 @dataclass
 class LowServeTransition:
     decision_id: int
+    serve_option_id: int
     mcs_id: int
     low_self_state: np.ndarray
     low_candidates: np.ndarray
@@ -252,10 +409,12 @@ class LowServeTransition:
     selected_need_power_kwh: float
     selected_distance_ratio: float
     selected_attraction: float
+    selected_immediate_iev_attraction: float
     selected_mcs_competition: float
     selected_fcs_competition: float
     selected_desirability: float
     available_avg_attraction: float
+    available_avg_immediate_iev_attraction: float
     available_avg_mcs_competition: float
     available_avg_fcs_competition: float
     available_avg_desirability: float
@@ -264,24 +423,32 @@ class LowServeTransition:
     value: float
     option_reward: float
     duration_steps: int
+    next_value: float
     terminal: bool
     truncated: bool
+    termination_reason: str = 'low_replan'
+    bootstrap_resolved: bool = False
     advantage: float = 0.0
     return_target: float = 0.0
     delayed_reward: float = 0.0
 
 
 class LowServeRolloutBuffer:
-    """仅保存 Serve 决策；每个 Serve option 是独立信用区间。
+    """保存 Low Serve option，并按实际 Low 决策间隔计算 SMDP-GAE。
 
-    Low 不跨后续 High option 传播 GAE，故 ``A_L = R_L - V_L``。
-    已关闭 transition 仍可通过 decision_id 补记延迟事件，避免静默丢奖。
+    一个 Low option 在 MCS 再次可决策时关闭，并只向同一
+    High Serve option 内的下一次 Low 决策 bootstrap。High Serve
+    正常/异常终止时同步切断 Low GAE 链，不再跨 Recharge 传播。
+    时间上限截断不属于业务终止，最后 transition 使用截断
+    状态的真实 Low value bootstrap。
     """
 
-    def __init__(self, gamma: float = 0.99):
+    def __init__(self, gamma: float = 0.99, gae_lambda: float = 0.95):
         self.gamma = float(gamma)
+        self.gae_lambda = float(gae_lambda)
         self.open_options: Dict[int, OpenLowServeOption] = {}
         self.open_decision_by_mcs: Dict[int, int] = {}
+        self.pending_transition_by_mcs: Dict[int, LowServeTransition] = {}
         self.transitions: List[LowServeTransition] = []
         self._transition_by_decision: Dict[int, LowServeTransition] = {}
         self._returns_ready = False
@@ -290,6 +457,7 @@ class LowServeRolloutBuffer:
     def start_option(
         self,
         decision_id: int,
+        serve_option_id: int,
         mcs_id: int,
         observation: Dict,
         action: Dict,
@@ -297,6 +465,7 @@ class LowServeRolloutBuffer:
         value: float,
     ) -> None:
         decision_id = int(decision_id)
+        serve_option_id = int(serve_option_id)
         mcs_id = int(mcs_id)
         if decision_id in self.open_options or decision_id in self._transition_by_decision:
             raise RuntimeError(f'Low decision_id={decision_id} 重复')
@@ -304,6 +473,14 @@ class LowServeRolloutBuffer:
             raise RuntimeError(f'MCS {mcs_id} 已有未关闭的 Low option')
         if int(action['low_action']) < 0:
             raise ValueError('只有 Serve 动作可以创建 Low option')
+        pending = self.pending_transition_by_mcs.pop(mcs_id, None)
+        if pending is not None:
+            if pending.serve_option_id != serve_option_id:
+                raise RuntimeError(
+                    'Low bootstrap 跨越了 High Serve option 边界'
+                )
+            pending.next_value = float(value)
+            pending.bootstrap_resolved = True
         low_action = int(action['low_action'])
         selected_candidate_id = int(
             observation['candidate_ids'][low_action]
@@ -359,6 +536,7 @@ class LowServeRolloutBuffer:
         self._returns_ready = False
         self.open_options[decision_id] = OpenLowServeOption(
             decision_id=decision_id,
+            serve_option_id=serve_option_id,
             mcs_id=mcs_id,
             low_self_state=np.asarray(observation['low_self_state'], dtype=np.float32).copy(),
             low_candidates=low_candidates.copy(),
@@ -383,21 +561,27 @@ class LowServeRolloutBuffer:
             ),
             selected_distance_ratio=float(low_candidates[low_action, 1]),
             selected_attraction=float(low_candidates[low_action, 2]),
-            selected_mcs_competition=float(
+            selected_immediate_iev_attraction=float(
                 low_candidates[low_action, 3]
             ),
-            selected_fcs_competition=float(
+            selected_mcs_competition=float(
                 low_candidates[low_action, 4]
+            ),
+            selected_fcs_competition=float(
+                low_candidates[low_action, 5]
             ),
             selected_desirability=float(
                 candidate_desirabilities[low_action]
             ),
             available_avg_attraction=candidate_mean(low_candidates[:, 2]),
-            available_avg_mcs_competition=candidate_mean(
+            available_avg_immediate_iev_attraction=candidate_mean(
                 low_candidates[:, 3]
             ),
-            available_avg_fcs_competition=candidate_mean(
+            available_avg_mcs_competition=candidate_mean(
                 low_candidates[:, 4]
+            ),
+            available_avg_fcs_competition=candidate_mean(
+                low_candidates[:, 5]
             ),
             available_avg_desirability=candidate_mean(
                 candidate_desirabilities
@@ -407,6 +591,25 @@ class LowServeRolloutBuffer:
             value=float(value),
         )
         self.open_decision_by_mcs[mcs_id] = decision_id
+
+    def pending_mcs_ids(self) -> set[int]:
+        """返回正在等待下一次真实 Low 决策的 MCS。"""
+        return set(self.pending_transition_by_mcs)
+
+    def bootstrap_mcs_ids(self) -> set[int]:
+        """返回截断时需要真实 Low value 的 MCS。"""
+        return (
+            set(self.open_decision_by_mcs)
+            | set(self.pending_transition_by_mcs)
+        )
+
+    def advance_pending_steps(self, mcs_ids: Iterable[int]) -> None:
+        """让未产生新 Low 决策的 transition 跨过一个零 Low-reward 步。"""
+        self._returns_ready = False
+        for mcs_id in mcs_ids:
+            transition = self.pending_transition_by_mcs.get(int(mcs_id))
+            if transition is not None:
+                transition.duration_steps += 1
 
     def add_step_rewards(self, reward_by_decision_id: Dict[int, float]) -> None:
         self._returns_ready = False
@@ -432,12 +635,17 @@ class LowServeRolloutBuffer:
     def close_options(
         self,
         decision_ready_ids: Iterable[int],
+        next_values: Dict[int, float] | None = None,
         terminal_ids: Iterable[int] = (),
         close_all: bool = False,
         truncated: bool = False,
     ) -> int:
         self._returns_ready = False
         ready = {int(value) for value in decision_ready_ids}
+        bootstrap_values = {
+            int(key): float(value)
+            for key, value in (next_values or {}).items()
+        }
         terminal = {int(value) for value in terminal_ids}
         close_decisions = [
             decision_id for decision_id, option in self.open_options.items()
@@ -446,8 +654,13 @@ class LowServeRolloutBuffer:
         for decision_id in close_decisions:
             option = self.open_options.pop(decision_id)
             self.open_decision_by_mcs.pop(option.mcs_id, None)
+            is_terminal = bool(
+                option.mcs_id in terminal
+                or (close_all and not truncated)
+            )
             transition = LowServeTransition(
                 decision_id=option.decision_id,
+                serve_option_id=option.serve_option_id,
                 mcs_id=option.mcs_id,
                 low_self_state=option.low_self_state,
                 low_candidates=option.low_candidates,
@@ -465,10 +678,16 @@ class LowServeRolloutBuffer:
                 selected_need_power_kwh=option.selected_need_power_kwh,
                 selected_distance_ratio=option.selected_distance_ratio,
                 selected_attraction=option.selected_attraction,
+                selected_immediate_iev_attraction=(
+                    option.selected_immediate_iev_attraction
+                ),
                 selected_mcs_competition=option.selected_mcs_competition,
                 selected_fcs_competition=option.selected_fcs_competition,
                 selected_desirability=option.selected_desirability,
                 available_avg_attraction=option.available_avg_attraction,
+                available_avg_immediate_iev_attraction=(
+                    option.available_avg_immediate_iev_attraction
+                ),
                 available_avg_mcs_competition=(
                     option.available_avg_mcs_competition
                 ),
@@ -483,27 +702,139 @@ class LowServeRolloutBuffer:
                 value=option.value,
                 option_reward=option.discounted_reward,
                 duration_steps=max(option.duration_steps, 1),
-                terminal=bool(
-                    option.mcs_id in terminal
-                    or (close_all and not truncated)
+                next_value=(
+                    bootstrap_values[option.mcs_id]
+                    if close_all and truncated
+                    and option.mcs_id not in terminal
+                    and option.mcs_id in bootstrap_values
+                    else 0.0
                 ),
+                terminal=is_terminal,
                 truncated=bool(close_all and truncated),
+                termination_reason=(
+                    'truncated' if close_all and truncated else (
+                        'terminal' if is_terminal else 'low_replan'
+                    )
+                ),
+                bootstrap_resolved=bool(is_terminal or close_all),
             )
+            if (
+                close_all and truncated
+                and option.mcs_id not in terminal
+                and option.mcs_id not in bootstrap_values
+            ):
+                raise RuntimeError(
+                    f'MCS {option.mcs_id} 缺少截断 Low bootstrap'
+                )
             self.transitions.append(transition)
             self._transition_by_decision[decision_id] = transition
+            if not transition.bootstrap_resolved:
+                if option.mcs_id in self.pending_transition_by_mcs:
+                    raise RuntimeError(
+                        f'MCS {option.mcs_id} 已有待bootstrap的Low transition'
+                    )
+                self.pending_transition_by_mcs[option.mcs_id] = transition
+
+        finalize_pending_ids = [
+            mcs_id for mcs_id in self.pending_transition_by_mcs
+            if close_all or mcs_id in terminal
+        ]
+        for mcs_id in finalize_pending_ids:
+            transition = self.pending_transition_by_mcs[mcs_id]
+            if close_all and truncated and mcs_id not in terminal:
+                if mcs_id not in bootstrap_values:
+                    raise RuntimeError(
+                        f'MCS {mcs_id} 缺少截断 Low bootstrap'
+                    )
+                transition.next_value = bootstrap_values[mcs_id]
+                transition.termination_reason = 'truncated'
+            else:
+                transition.next_value = 0.0
+                transition.termination_reason = 'terminal'
+            transition.terminal = bool(
+                mcs_id in terminal or (close_all and not truncated)
+            )
+            transition.truncated = bool(close_all and truncated)
+            transition.bootstrap_resolved = True
+            self.pending_transition_by_mcs.pop(mcs_id)
         return len(close_decisions)
 
-    def compute_returns_and_advantages(self) -> None:
+    def terminate_serve_options(
+        self,
+        serve_option_ids: Iterable[int],
+        reason: str,
+    ) -> int:
+        """在 High Serve 边界上终止对应 Low GAE 链。"""
+        target_ids = {int(value) for value in serve_option_ids}
+        if not target_ids:
+            return 0
+        self._returns_ready = False
+        affected = 0
         for transition in self.transitions:
-            transition.advantage = float(
-                transition.option_reward - transition.value
+            if (
+                transition.serve_option_id in target_ids
+                and not transition.bootstrap_resolved
+            ):
+                transition.next_value = 0.0
+                transition.terminal = True
+                transition.truncated = False
+                transition.termination_reason = str(reason)
+                transition.bootstrap_resolved = True
+                self.pending_transition_by_mcs.pop(
+                    transition.mcs_id, None
+                )
+                affected += 1
+        dangling = [
+            item.decision_id for item in self.open_options.values()
+            if item.serve_option_id in target_ids
+        ]
+        if dangling:
+            raise RuntimeError(
+                f'High Serve 终止时仍有未关闭 Low option: {dangling[:10]}'
             )
-            transition.return_target = float(transition.option_reward)
+        return affected
+
+    def compute_returns_and_advantages(self) -> None:
+        if self.open_options:
+            raise RuntimeError('存在未关闭的Low option，不能计算GAE')
+        if self.pending_transition_by_mcs:
+            raise RuntimeError('存在未完成bootstrap的Low transition')
+        unresolved = [
+            item.decision_id for item in self.transitions
+            if not item.bootstrap_resolved
+        ]
+        if unresolved:
+            raise RuntimeError(
+                f'Low transition缺少bootstrap: {unresolved[:10]}'
+            )
+
+        running_advantage: Dict[tuple[int, int], float] = {}
+        for transition in reversed(self.transitions):
+            continuation = 0.0 if transition.terminal else 1.0
+            option_discount = self.gamma ** transition.duration_steps
+            delta = (
+                transition.option_reward
+                + continuation * option_discount * transition.next_value
+                - transition.value
+            )
+            chain_key = (
+                transition.mcs_id, transition.serve_option_id
+            )
+            next_advantage = running_advantage.get(chain_key, 0.0)
+            transition.advantage = float(
+                delta
+                + continuation * option_discount * self.gae_lambda
+                * next_advantage
+            )
+            transition.return_target = transition.advantage + transition.value
+            running_advantage[chain_key] = transition.advantage
         self._returns_ready = True
 
     def extend_completed(self, other: 'LowServeRolloutBuffer') -> None:
         if other.open_options:
             raise RuntimeError('不能合并仍有 open Low option 的 rollout')
+        if other.pending_transition_by_mcs:
+            raise RuntimeError('不能合并仍待bootstrap的Low rollout')
         if not other._returns_ready:
             other.compute_returns_and_advantages()
         for transition in other.transitions:

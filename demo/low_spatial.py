@@ -38,6 +38,12 @@ QUASI_URGENCY_BONUS = 0.50
 IEV_BASE_OPPORTUNITY = 1.00
 IEV_WAIT_URGENCY_BONUS = 0.50
 
+# 只用于 EV_attraction 聚合。IEV 是已经形成的即时充电需求，必须比
+# 仍处于潜在需求阶段的 quasi 获得更高权重；候选排序和单车紧急度仍
+# 使用上面的 opportunity，避免重复放大。
+QUASI_ATTRACTION_WEIGHT = 1.00
+IEV_ATTRACTION_WEIGHT = 1.50
+
 # task MCS 和 busy FCS 当前不能立即参与匹配，但它们仍表示候选区域已有
 # 服务资源。权重低于当前可用资源，避免把“繁忙”误判为完全资源富余。
 TASK_MCS_COMPETITION_WEIGHT = 0.25
@@ -141,7 +147,7 @@ def compute_low_candidate_metrics(mcs: MCS, quasi: EV) -> Dict[str, float]:
     candidate_distance_km = distance_km(mcs, quasi)
     urgency_demand = ev_service_opportunity(quasi)
 
-    attraction_raw = urgency_demand
+    attraction_raw = QUASI_ATTRACTION_WEIGHT * urgency_demand
     immediate_iev_raw = 0.0
     seen_ev_ids = {int(quasi.id)}
     for other in getattr(quasi, 'near_quasi', []):
@@ -149,7 +155,8 @@ def compute_low_candidate_metrics(mcs: MCS, quasi: EV) -> Dict[str, float]:
             continue
         seen_ev_ids.add(int(other.id))
         attraction_raw += (
-            ev_service_opportunity(other)
+            QUASI_ATTRACTION_WEIGHT
+            * ev_service_opportunity(other)
             * distance_kernel(distance_km(quasi, other))
         )
     for iev in getattr(quasi, 'near_iev', []):
@@ -157,7 +164,7 @@ def compute_low_candidate_metrics(mcs: MCS, quasi: EV) -> Dict[str, float]:
             continue
         seen_ev_ids.add(int(iev.id))
         value = (
-            ev_service_opportunity(iev)
+            IEV_ATTRACTION_WEIGHT * ev_service_opportunity(iev)
             * distance_kernel(distance_km(quasi, iev))
         )
         attraction_raw += value
@@ -273,7 +280,7 @@ def compute_low_stay_metrics(mcs: MCS) -> Dict[str, float]:
             continue
         seen_ev_ids.add(int(quasi.id))
         attraction_raw += (
-            ev_service_opportunity(quasi)
+            QUASI_ATTRACTION_WEIGHT * ev_service_opportunity(quasi)
             * distance_kernel(distance_km(mcs, quasi))
         )
     for iev in getattr(mcs, 'near_iev', []):
@@ -281,7 +288,7 @@ def compute_low_stay_metrics(mcs: MCS) -> Dict[str, float]:
             continue
         seen_ev_ids.add(int(iev.id))
         value = (
-            ev_service_opportunity(iev)
+            IEV_ATTRACTION_WEIGHT * ev_service_opportunity(iev)
             * distance_kernel(distance_km(mcs, iev))
         )
         attraction_raw += value

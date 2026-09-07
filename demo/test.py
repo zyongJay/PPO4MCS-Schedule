@@ -4,7 +4,8 @@
 
 1. 一个或多个指定 checkpoint 的 RL 策略；
 2. 与 run_test.py 一致的随机调度策略；
-3. 不调度策略：IEV 沿轨迹行驶，MCS 始终停在原地且不主动补电。
+3. 不调度策略：IEV 沿轨迹行驶；空闲 MCS 不主动移动或补电，但仍可被
+   环境的即时匹配器分配 IEV 任务并自动执行服务。
 
 默认评测 V1（training_results_gpu）以及 V2--V5 的 Episode 300 checkpoint，
 并同时评测随机调度和不调度两款基线。所有策略共享 20 个固定场景。
@@ -39,6 +40,8 @@ import torch
 
 import world as world_module
 from config import (
+    MAX_CONSECUTIVE_NO_CANDIDATE_LOW_REPLANS,
+    MAX_SERVE_OPTION_STEPS,
     MAX_STEPS_PER_EPISODE,
     MCS_CRITIC_STATE_DIM,
     MCS_FEAT_DIM_self,
@@ -204,13 +207,17 @@ class RLDecisionPolicy(DecisionPolicy):
     def __init__(self, agent: MCSMAPPOAgent):
         self.agent = agent
         self.recharge_matcher = RechargeMatcher()
+        self.active_high_options: Dict[int, Dict] = {}
+        self.low_candidate_dim = int(getattr(
+            agent, 'evaluation_low_candidate_dim', MCS_FEAT_DIM_tgt
+        ))
 
     def synchronize(self) -> None:
         if self.agent.device.type == 'cuda':
             torch.cuda.synchronize(self.agent.device)
 
     @torch.no_grad()
-    def _greedy_mcs_actions(
+    def _greedy_high_actions(
         self, observations: Sequence[Dict]
     ) -> List[Dict]:
         if not observations:
@@ -228,37 +235,51 @@ class RLDecisionPolicy(DecisionPolicy):
         high_actions = high_distribution.probs.argmax(dim=-1)
         high_indices = high_actions.detach().cpu().numpy().astype(int)
 
-        results = [{
+        return [{
             'mode': MCS_ACTION_NAMES[action_index],
-            'low_action': -1,
         } for action_index in high_indices]
 
-        serve_indices = np.flatnonzero(high_indices == 0)
-        if serve_indices.size:
-            low_self_states = self.agent._tensor(np.stack([
-                observations[index]['low_self_state']
-                for index in serve_indices
-            ]))
-            low_candidates = self.agent._tensor(np.stack([
-                observations[index]['low_candidates']
-                for index in serve_indices
-            ]))
-            low_masks = self.agent._tensor(np.stack([
-                observations[index]['low_candidate_mask']
-                for index in serve_indices
-            ]), dtype=torch.bool)
-            low_distribution = self.agent.low_actor.distribution(
-                low_self_states, low_candidates, low_masks
+    @torch.no_grad()
+    def _greedy_low_actions(
+        self, observations: Sequence[Dict]
+    ) -> List[int]:
+        if not observations:
+            return []
+        low_self_states = self.agent._tensor(np.stack([
+            observation['low_self_state'] for observation in observations
+        ]))
+        projected_candidates = []
+        for observation in observations:
+            candidates = np.asarray(
+                observation['low_candidates'], dtype=np.float32
             )
-            low_actions = (
-                low_distribution.probs.argmax(dim=-1)
-                .detach().cpu().numpy().astype(int)
-            )
-            for batch_index, observation_index in enumerate(serve_indices):
-                results[int(observation_index)]['low_action'] = int(
-                    low_actions[batch_index]
+            if candidates.shape[-1] == self.low_candidate_dim:
+                projected = candidates
+            elif candidates.shape[-1] == 6 and self.low_candidate_dim == 5:
+                # 当前 v10 在 index=3 新增 immediate_iev_attraction。v8 的
+                # 5维Actor继续接收其训练时的
+                # [urgency, distance, attraction, mcs_comp, fcs_comp]。
+                projected = np.concatenate(
+                    (candidates[:, :3], candidates[:, 4:]), axis=-1
                 )
-        return results
+            else:
+                raise ValueError(
+                    '无法把当前Low候选维度 '
+                    f'{candidates.shape[-1]} 投影到checkpoint维度 '
+                    f'{self.low_candidate_dim}'
+                )
+            projected_candidates.append(projected)
+        low_candidates = self.agent._tensor(np.stack(projected_candidates))
+        low_masks = self.agent._tensor(np.stack([
+            observation['low_candidate_mask'] for observation in observations
+        ]), dtype=torch.bool)
+        distribution = self.agent.low_actor.distribution(
+            low_self_states, low_candidates, low_masks
+        )
+        return (
+            distribution.probs.argmax(dim=-1)
+            .detach().cpu().numpy().astype(int).tolist()
+        )
 
     def build_actions(
         self,
@@ -274,20 +295,73 @@ class RLDecisionPolicy(DecisionPolicy):
         acting_mcss = [
             actor for actor in acting_agents if isinstance(actor, MCS)
         ]
-        mcs_observations = [
-            observation_by_agent[mcs] for mcs in acting_mcss
-        ]
-        selected_actions = self._greedy_mcs_actions(mcs_observations)
-        selected_by_id = {
-            mcs.id: (observation, action)
-            for mcs, observation, action in zip(
-                acting_mcss, mcs_observations, selected_actions
+        mcs_by_id = {mcs.id: mcs for mcs in env.world.MCSs}
+        # 先根据物理状态回收已完成或异常终止的 option。
+        for mcs_id, state in list(self.active_high_options.items()):
+            mcs = mcs_by_id[mcs_id]
+            if state['mode'] == 'Serve' and mcs.is_task:
+                state['task_started'] = True
+            completed = bool(
+                state['mode'] == 'Serve'
+                and state['task_started']
+                and mcs.is_idle
+            ) or bool(
+                state['mode'] == 'Recharge'
+                and state['matched']
+                and mcs.is_idle
             )
-        }
+            abnormal = bool(
+                state['mode'] == 'Serve'
+                and (
+                    state['duration_steps'] >= MAX_SERVE_OPTION_STEPS
+                    or state['no_candidate_replans']
+                    >= MAX_CONSECUTIVE_NO_CANDIDATE_LOW_REPLANS
+                )
+            )
+            if completed or abnormal or mcs.is_broken or mcs.is_energy_stranded:
+                self.active_high_options.pop(mcs_id, None)
 
+        # 安全裕度进入 recharge-only 时终止旧 Serve。
+        for mcs in acting_mcss:
+            observation = observation_by_agent[mcs]
+            state = self.active_high_options.get(mcs.id)
+            if (
+                state is not None
+                and state['mode'] == 'Serve'
+                and bool(observation.get('high_recharge_only', False))
+            ):
+                self.active_high_options.pop(mcs.id)
+
+        boundary_mcss = [
+            mcs for mcs in acting_mcss
+            if mcs.id not in self.active_high_options
+        ]
+        boundary_actions = self._greedy_high_actions([
+            observation_by_agent[mcs] for mcs in boundary_mcss
+        ])
+        for mcs, action in zip(boundary_mcss, boundary_actions):
+            self.active_high_options[mcs.id] = {
+                'mode': action['mode'],
+                'duration_steps': 0,
+                'no_candidate_replans': 0,
+                'task_started': False,
+                'matched': False,
+            }
+
+        active_serve_mcss = [
+            mcs for mcs in acting_mcss
+            if self.active_high_options[mcs.id]['mode'] == 'Serve'
+        ]
+        low_actions = self._greedy_low_actions([
+            observation_by_agent[mcs] for mcs in active_serve_mcss
+        ])
+        low_action_by_id = {
+            mcs.id: low_actions[index]
+            for index, mcs in enumerate(active_serve_mcss)
+        }
         recharge_requests = [
-            mcs for mcs, action in zip(acting_mcss, selected_actions)
-            if action['mode'] == 'Recharge'
+            mcs for mcs in acting_mcss
+            if self.active_high_options[mcs.id]['mode'] == 'Recharge'
         ]
         recharge_results = self.recharge_matcher.match_all(
             recharge_requests, env.world.FCSs
@@ -304,9 +378,12 @@ class RLDecisionPolicy(DecisionPolicy):
                 action_n.append(iev_track_action(actor))
                 continue
 
-            observation, action = selected_by_id[actor.id]
-            if action['mode'] == 'Recharge':
+            observation = observation_by_agent[actor]
+            state = self.active_high_options[actor.id]
+            state['duration_steps'] += 1
+            if state['mode'] == 'Recharge':
                 matched = actor.id in recharge_matched_ids
+                state['matched'] = bool(state['matched'] or matched)
                 action_n.append({
                     'mode': 'Recharge' if matched else 'Wait',
                     'requested_mode': 'Recharge',
@@ -317,12 +394,17 @@ class RLDecisionPolicy(DecisionPolicy):
                     ),
                 })
             else:
+                low_action = low_action_by_id[actor.id]
                 candidate_id = int(
-                    observation['candidate_ids'][action['low_action']]
+                    observation['candidate_ids'][low_action]
                 )
                 low_stay_selected = candidate_id == MCS_STAY_CANDIDATE_ID
                 has_quasi_candidate = bool(
                     observation.get('quasi_candidate_count', 0) > 0
+                )
+                state['no_candidate_replans'] = (
+                    0 if has_quasi_candidate
+                    else state['no_candidate_replans'] + 1
                 )
                 target_pos = (
                     list(actor.pos)
@@ -342,6 +424,104 @@ class RLDecisionPolicy(DecisionPolicy):
                     ),
                     'has_quasi_candidate': has_quasi_candidate,
                 })
+        return action_n
+
+
+class LegacyStepRLDecisionPolicy(RLDecisionPolicy):
+    """在当前物理环境中复现 v8 的逐 step High/Low 决策语义。"""
+
+    def build_actions(
+        self,
+        env: MultiAgentEnv,
+        acting_agents: Sequence,
+        observations: Sequence[Dict],
+    ) -> List[Dict]:
+        observation_by_agent = {
+            actor: observations[index]
+            for index, actor in enumerate(acting_agents)
+            if index < len(observations)
+        }
+        acting_mcss = [
+            actor for actor in acting_agents if isinstance(actor, MCS)
+        ]
+        high_actions = self._greedy_high_actions([
+            observation_by_agent[mcs] for mcs in acting_mcss
+        ])
+        high_mode_by_id = {
+            mcs.id: high_actions[index]['mode']
+            for index, mcs in enumerate(acting_mcss)
+        }
+        serve_mcss = [
+            mcs for mcs in acting_mcss
+            if high_mode_by_id[mcs.id] == 'Serve'
+        ]
+        low_actions = self._greedy_low_actions([
+            observation_by_agent[mcs] for mcs in serve_mcss
+        ])
+        low_action_by_id = {
+            mcs.id: low_actions[index]
+            for index, mcs in enumerate(serve_mcss)
+        }
+        recharge_mcss = [
+            mcs for mcs in acting_mcss
+            if high_mode_by_id[mcs.id] == 'Recharge'
+        ]
+        recharge_results = self.recharge_matcher.match_all(
+            recharge_mcss, env.world.FCSs
+        )
+        recharge_matched_ids = {
+            int(result['mcs_id'])
+            for result in recharge_results if result.get('success')
+        }
+        ev_by_id = {ev.id: ev for ev in env.world.EVs}
+
+        action_n = []
+        for actor in acting_agents:
+            if isinstance(actor, EV):
+                action_n.append(iev_track_action(actor))
+                continue
+            observation = observation_by_agent[actor]
+            if high_mode_by_id[actor.id] == 'Recharge':
+                matched = actor.id in recharge_matched_ids
+                action_n.append({
+                    'mode': 'Recharge' if matched else 'Wait',
+                    'requested_mode': 'Recharge',
+                    'recharge_matched': matched,
+                    'high_action_mask': observation[
+                        'high_action_mask'
+                    ].tolist(),
+                    'target_pos': (
+                        list(actor.current_target_pos)
+                        if matched else list(actor.pos)
+                    ),
+                })
+                continue
+
+            low_action = low_action_by_id[actor.id]
+            candidate_id = int(observation['candidate_ids'][low_action])
+            low_stay_selected = candidate_id == MCS_STAY_CANDIDATE_ID
+            has_quasi_candidate = bool(
+                observation.get('quasi_candidate_count', 0) > 0
+            )
+            action_n.append({
+                'mode': 'Serve',
+                'requested_mode': 'Serve',
+                'recharge_matched': False,
+                'high_action_mask': observation[
+                    'high_action_mask'
+                ].tolist(),
+                'target_pos': (
+                    list(actor.pos)
+                    if low_stay_selected
+                    else list(ev_by_id[candidate_id].pos)
+                ),
+                'low_candidate_id': candidate_id,
+                'low_stay_selected': low_stay_selected,
+                'low_forced_stay': bool(
+                    low_stay_selected and not has_quasi_candidate
+                ),
+                'has_quasi_candidate': has_quasi_candidate,
+            })
         return action_n
 
 
@@ -406,9 +586,17 @@ class RandomDecisionPolicy(DecisionPolicy):
                     'target_pos': list(actor.pos),
                 })
             else:
-                quasi_candidates = [
-                    ev for ev in actor.near_quasi if ev.is_quasi
-                ]
+                # 完整 Random 只随机化“如何选择”，不绕过仿真的物理安全
+                # 约束。保留通信范围内所有满足
+                # MCS当前位置 -> quasi -> 最近物理FCS 返程能量安全的候选；
+                # 不应用紧急度 Top-K，避免把 V8 的排序先验混入随机基线。
+                quasi_candidates = (
+                    env.world.obs_builder.get_reachable_serve_candidates(
+                        actor,
+                        env.world.FCSs,
+                        apply_topk=False,
+                    )
+                )
                 if quasi_candidates:
                     target = self.rng.choice(quasi_candidates)
                     action_n.append({
@@ -428,7 +616,11 @@ class RandomDecisionPolicy(DecisionPolicy):
 
 
 class NoScheduleDecisionPolicy(DecisionPolicy):
-    """IEV 正常行驶，MCS 不移动且不主动申请补电。"""
+    """IEV 正常行驶；空闲 MCS 不主动移动或申请补电。
+
+    环境的 ImmediateMatcher 仍可把空闲 MCS 分配给 IEV；任务阶段的移动
+    与充电由环境自动推进，不属于本策略的主动调度动作。
+    """
 
     def build_actions(
         self,
@@ -456,15 +648,41 @@ def load_rl_agent(
     hidden_dim: int,
     device: str,
 ) -> tuple[MCSMAPPOAgent, Dict]:
+    raw_checkpoint = torch.load(
+        checkpoint_path, map_location='cpu', weights_only=False
+    )
+    candidate_weight = raw_checkpoint['low_actor'][
+        'candidate_encoder.0.weight'
+    ]
+    checkpoint_candidate_dim = int(candidate_weight.shape[1])
     agent = MCSMAPPOAgent(
         high_state_dim=MCS_HIGH_FEAT_DIM,
         low_self_dim=MCS_FEAT_DIM_self,
-        low_candidate_dim=MCS_FEAT_DIM_tgt,
+        low_candidate_dim=checkpoint_candidate_dim,
         critic_state_dim=MCS_CRITIC_STATE_DIM,
         hidden_dim=hidden_dim,
         device=device,
     )
-    metadata = agent.load(checkpoint_path)
+    metadata = dict(agent.load(checkpoint_path))
+    design_version = str(
+        metadata.get('config', {}).get('low_reward_design_version', '')
+    )
+    inference_semantics = (
+        'legacy_per_step_high'
+        if design_version.startswith('v8_') else 'option_boundary_high'
+    )
+    agent.evaluation_low_candidate_dim = checkpoint_candidate_dim
+    agent.evaluation_inference_semantics = inference_semantics
+    metadata['evaluation_compatibility'] = {
+        'checkpoint_low_candidate_dim': checkpoint_candidate_dim,
+        'current_environment_low_candidate_dim': int(MCS_FEAT_DIM_tgt),
+        'observation_adapter': (
+            'drop_current_immediate_iev_attraction_index3'
+            if checkpoint_candidate_dim == 5 and MCS_FEAT_DIM_tgt == 6
+            else 'identity'
+        ),
+        'inference_semantics': inference_semantics,
+    }
     agent.eval()
     return agent, metadata
 
@@ -477,6 +695,10 @@ def build_decision_policy(
     if spec.policy_type == 'rl':
         if agent is None:
             raise RuntimeError('RL 策略缺少已加载的 agent')
+        if getattr(
+            agent, 'evaluation_inference_semantics', ''
+        ) == 'legacy_per_step_high':
+            return LegacyStepRLDecisionPolicy(agent)
         return RLDecisionPolicy(agent)
     if spec.policy_type == 'random':
         return RandomDecisionPolicy(seed)
@@ -527,6 +749,26 @@ def evaluate_scenario(
     remember_charge_providers(env.world.EVs, provider_by_ev_id)
     decision_times_ms = []
     executed_steps = 0
+    mcs_action_counts = {
+        'Serve': 0,
+        'Recharge': 0,
+        'Wait': 0,
+        'Other': 0,
+    }
+    low_move_action_count = 0
+    low_active_stay_action_count = 0
+    low_forced_stay_action_count = 0
+    recharge_matched_action_count = 0
+    event_audit_names = (
+        'rescue_success_count',
+        'replacement_success_count',
+        'immediate_counterfactual_replacement_count',
+        'future_rescue_evaluated_success_count',
+        'counterfactual_failure_probability_sum',
+        'controllable_failure_count',
+        'uncontrollable_failure_count',
+    )
+    event_audit_totals = {name: 0.0 for name in event_audit_names}
 
     for _ in range(max_steps):
         acting_agents = list(env.world.agents)
@@ -549,9 +791,35 @@ def evaluate_scenario(
                 f'{spec.policy_name}: action_n 与 acting_agents 数量不一致'
             )
 
+        for actor, action in zip(acting_agents, action_n):
+            if not isinstance(actor, MCS):
+                continue
+            requested_mode = str(action.get(
+                'requested_mode', action.get('mode', 'Other')
+            ))
+            action_key = (
+                requested_mode if requested_mode in mcs_action_counts
+                else 'Other'
+            )
+            mcs_action_counts[action_key] += 1
+            if requested_mode == 'Serve':
+                if bool(action.get('low_stay_selected', False)):
+                    if bool(action.get('low_forced_stay', False)):
+                        low_forced_stay_action_count += 1
+                    else:
+                        low_active_stay_action_count += 1
+                else:
+                    low_move_action_count += 1
+            if bool(action.get('recharge_matched', False)):
+                recharge_matched_action_count += 1
+
         # 仿真推进严格放在决策计时区间之外。
         observations, _, _, _ = env.step(action_n)
         executed_steps += 1
+        for name in event_audit_names:
+            event_audit_totals[name] += float(
+                env.world.last_system_reward_event.get(name, 0.0)
+            )
         remember_charge_providers(env.world.EVs, provider_by_ev_id)
         if env.world.get_done():
             break
@@ -587,6 +855,17 @@ def evaluate_scenario(
         )
 
     success_denominator = max(success_count, 1)
+    mcs_action_total = max(sum(mcs_action_counts.values()), 1)
+    low_action_total = max(
+        low_move_action_count
+        + low_active_stay_action_count
+        + low_forced_stay_action_count,
+        1,
+    )
+    audited_mcs_success_count = (
+        event_audit_totals['rescue_success_count']
+        + event_audit_totals['replacement_success_count']
+    )
     checkpoint_episode = checkpoint_metadata.get('episode', '')
     if not checkpoint_episode and spec.checkpoint_path is not None:
         match = re.search(r'(\d+)', spec.checkpoint_path.stem)
@@ -615,6 +894,13 @@ def evaluate_scenario(
         'ev_failure_count': int(failure_count),
         'ev_unresolved_count': int(unresolved_count),
         'avg_mcs_profit': mean_attribute(mcss, 'total_profit'),
+        'avg_mcs_cost': mean_attribute(mcss, 'total_cost'),
+        'avg_mcs_charged_kwh': mean_attribute(
+            mcss, 'total_charged_kwh'
+        ),
+        'avg_mcs_energy_consumed_kwh': mean_attribute(
+            mcss, 'total_energy_consumed'
+        ),
         'avg_mcs_idle_time_min': mean_attribute(
             mcss, 'total_idle_time_min'
         ),
@@ -641,7 +927,70 @@ def evaluate_scenario(
         'successful_ev_fcs_share': (
             provider_counts['FCS'] / success_denominator
         ),
+        'mcs_serve_action_step_count': int(mcs_action_counts['Serve']),
+        'mcs_recharge_action_step_count': int(
+            mcs_action_counts['Recharge']
+        ),
+        'mcs_wait_action_step_count': int(mcs_action_counts['Wait']),
+        'mcs_other_action_step_count': int(mcs_action_counts['Other']),
+        'mcs_serve_action_step_rate': (
+            mcs_action_counts['Serve'] / mcs_action_total
+        ),
+        'mcs_recharge_action_step_rate': (
+            mcs_action_counts['Recharge'] / mcs_action_total
+        ),
+        'mcs_wait_action_step_rate': (
+            mcs_action_counts['Wait'] / mcs_action_total
+        ),
+        'low_move_action_count': int(low_move_action_count),
+        'low_active_stay_action_count': int(low_active_stay_action_count),
+        'low_forced_stay_action_count': int(low_forced_stay_action_count),
+        'low_move_action_rate': low_move_action_count / low_action_total,
+        'low_active_stay_action_rate': (
+            low_active_stay_action_count / low_action_total
+        ),
+        'low_forced_stay_action_rate': (
+            low_forced_stay_action_count / low_action_total
+        ),
+        'recharge_matched_action_count': int(
+            recharge_matched_action_count
+        ),
+        'rescue_success_count': int(
+            event_audit_totals['rescue_success_count']
+        ),
+        'replacement_success_count': int(
+            event_audit_totals['replacement_success_count']
+        ),
+        'rescue_success_share_of_mcs_success': (
+            event_audit_totals['rescue_success_count']
+            / max(audited_mcs_success_count, 1.0)
+        ),
+        'immediate_counterfactual_replacement_count': int(
+            event_audit_totals[
+                'immediate_counterfactual_replacement_count'
+            ]
+        ),
+        'future_rescue_evaluated_success_count': int(
+            event_audit_totals['future_rescue_evaluated_success_count']
+        ),
+        'avg_counterfactual_failure_probability_per_mcs_success': (
+            event_audit_totals[
+                'counterfactual_failure_probability_sum'
+            ] / max(audited_mcs_success_count, 1.0)
+        ),
+        'controllable_failure_count': int(
+            event_audit_totals['controllable_failure_count']
+        ),
+        'uncontrollable_failure_count': int(
+            event_audit_totals['uncontrollable_failure_count']
+        ),
         'broken_mcs_count': int(sum(mcs.is_broken for mcs in mcss)),
+        'energy_stranded_mcs_count': int(sum(
+            mcs.is_energy_stranded for mcs in mcss
+        )),
+        'unavailable_mcs_count': int(sum(
+            mcs.is_broken or mcs.is_energy_stranded for mcs in mcss
+        )),
     }
     return row
 
@@ -702,6 +1051,9 @@ def print_summary(summary: pd.DataFrame) -> None:
         'avg_decision_time_ms',
         'successful_ev_mcs_share',
         'successful_ev_fcs_share',
+        'broken_mcs_count',
+        'energy_stranded_mcs_count',
+        'unavailable_mcs_count',
     ]
     printable = summary[columns].copy()
     print('\n固定场景评测汇总（跨场景均值）')

@@ -21,7 +21,14 @@ from config import *
 from core import EV, MCS, FCS, euclidean_distance
 from matching import ImmediateMatcher
 from observation import ObservationBuilder
-from reward import RewardBuilder
+from reward import (
+    FAILURE_RESPONSIBILITY_DECAY,
+    FAILURE_RESPONSIBILITY_MAX_AGE_STEPS,
+    MCS_SUCCESS_BASE_CREDIT,
+    MCS_SUCCESS_RESCUE_CREDIT,
+    RESCUE_SUCCESS_THRESHOLD,
+    RewardBuilder,
+)
 
 
 # ============================================================
@@ -56,6 +63,7 @@ class World:
         self.current_step = 0
         self.mcs_step_events: Dict[int, Dict] = {}
         self.last_mcs_reward_components: Dict[int, Dict[str, float]] = {}
+        self.last_high_reward_by_option: Dict[int, float] = {}
         self.last_immediate_results: List[Dict] = []
         # 保存当前step动作执行前的EV结果状态，用于识别系统级新增成功/失败。
         self.ev_outcomes_before_step: Dict[int, tuple[bool, bool]] = {}
@@ -65,6 +73,11 @@ class World:
         self.last_low_event_records: List[Dict] = []
         # 新失败在下一轮匹配前计算责任，避免用匹配后的资源状态回溯责任。
         self.pending_failure_responsibilities: Dict[int, Dict[int, float]] = {}
+        self.pending_failure_low_decisions: Dict[int, Dict[int, int]] = {}
+        self.pending_failure_causal_records: Dict[int, Dict[int, Dict]] = {}
+        # 在有限回看窗口内保存最近一次真实可行的服务机会。IEV 在
+        # MCS 随后转去 Recharge/其他任务后失败时，仍可沿原 Low 决策回传。
+        self.failure_responsibility_history: Dict[int, Dict] = {}
         self.init_world()
 
     def _would_mcs_be_energy_stranded(self, mcs: MCS) -> bool:
@@ -86,9 +99,7 @@ class World:
             ) / 1000.0 * POWER_UNIT
             for fcs in self.FCSs
         )
-        return bool(
-            float(mcs.remain) + 1e-12 < float(nearest_required_energy)
-        )
+        return bool(not float(mcs.remain) > float(nearest_required_energy))
 
     def _is_mcs_energy_stranded(self, mcs: MCS) -> bool:
         """返回持久受困状态，兼容尚未固化状态的边界检查。"""
@@ -169,12 +180,16 @@ class World:
         self.current_step = 0
         self.mcs_step_events.clear()
         self.last_mcs_reward_components.clear()
+        self.last_high_reward_by_option.clear()
         self.last_immediate_results.clear()
         self.ev_outcomes_before_step.clear()
         self.last_system_reward_event.clear()
         self.last_low_reward_by_decision.clear()
         self.last_low_event_records.clear()
         self.pending_failure_responsibilities.clear()
+        self.pending_failure_low_decisions.clear()
+        self.pending_failure_causal_records.clear()
+        self.failure_responsibility_history.clear()
 
         random.seed(self.seed_val)
         np.random.seed(self.seed_val)
@@ -258,7 +273,23 @@ class World:
                 'is_energy_stranded': bool(
                     getattr(mcs, 'is_energy_stranded', False)
                 ),
+                'total_profit': float(mcs.total_profit),
+                'total_cost': float(mcs.total_cost),
             }
+
+        # 在策略动作改变资源状态前冻结真实可行服务机会。具体 High/Low ID
+        # 必须在解析本 step 动作后再写入，避免把新 Option 的机会错挂到上一个
+        # 已关闭 Option。
+        pre_action_failure_opportunities: Dict[int, Dict[int, float]] = {}
+        for ev in self.EVs:
+            if ev.is_charged or ev.fail_charge or ev.is_normal:
+                continue
+            weights = self.reward_builder.compute_failure_responsibility_weights(
+                ev, self.MCSs
+            )
+            if not weights:
+                continue
+            pre_action_failure_opportunities[int(ev.id)] = dict(weights)
 
         action_by_mcs_id = {}
         for index, agent in enumerate(self.agents):
@@ -301,18 +332,27 @@ class World:
             ).reshape(-1)
             if high_action_mask.size < 2:
                 # 兼容旧调用方：按动作执行前的局部状态重建有效动作掩码。
-                recharge_available = bool(
-                    self.obs_builder.get_reachable_recharge_candidates(
+                physical_fcss = (
+                    self.obs_builder.get_physically_reachable_fcss(
                         agent, self.FCSs
                     )
                 )
-                high_action_mask = np.asarray([
-                    True, recharge_available
-                ], dtype=bool)
+                recharge_available = bool(physical_fcss)
+                nearest_energy = (
+                    float(physical_fcss[0][2])
+                    if physical_fcss else float('inf')
+                )
+                serve_available = bool(
+                    float(agent.remain)
+                    > float(MCS_SERVE_SAFETY_RESERVE_KWH) + nearest_energy
+                )
+                high_action_mask = np.asarray(
+                    [serve_available, recharge_available], dtype=bool
+                )
             else:
-                # 旧三动作调用方只读取前两个动作；Serve 由Low当前位置保底。
+                # 旧三动作调用方只读取前两个动作。不得在这里
+                # 强制打开 Serve，否则会绕过 recharge-only 安全域。
                 high_action_mask = high_action_mask[:2].copy()
-                high_action_mask[0] = True
             action_by_mcs_id[agent.id] = {
                 'mode': mode,
                 'requested_mode': action.get('requested_mode', mode),
@@ -320,6 +360,9 @@ class World:
                 'high_action_mask': high_action_mask,
                 'low_decision_id': int(action.get('low_decision_id', -1)),
                 'serve_option_id': int(action.get('serve_option_id', -1)),
+                'high_option_id': int(action.get(
+                    'high_option_id', action.get('serve_option_id', -1)
+                )),
                 'low_candidate_id': int(action.get('low_candidate_id', -1)),
                 'low_stay_selected': bool(
                     action.get('low_stay_selected', False)
@@ -328,7 +371,18 @@ class World:
                 'has_quasi_candidate': bool(
                     action.get('has_quasi_candidate', False)
                 ),
+                'low_candidate_priority_reward': float(
+                    action.get('low_candidate_priority_reward', 0.0)
+                ),
             }
+            high_option_id = int(
+                action_by_mcs_id[agent.id]['high_option_id']
+            )
+            if high_option_id >= 0:
+                agent.active_high_option_id = high_option_id
+                agent.active_high_mode = str(
+                    action_by_mcs_id[agent.id]['requested_mode']
+                )
             if action_by_mcs_id[agent.id]['requested_mode'] == 'Serve':
                 low_decision_id = action_by_mcs_id[agent.id][
                     'low_decision_id'
@@ -336,14 +390,19 @@ class World:
                 serve_option_id = action_by_mcs_id[agent.id][
                     'serve_option_id'
                 ]
+                previous_serve_option_id = int(
+                    getattr(agent, 'active_serve_option_id', -1)
+                )
+                # 训练使用稳定的非负 option_id；旧评测脚本使用 -1，
+                # 但每次显式 Serve 动作同样代表一个新的可匹配窗口。
                 if (
-                    low_decision_id >= 0
-                    and serve_option_id >= 0
-                    and low_decision_id != serve_option_id
+                    serve_option_id < 0
+                    or serve_option_id != previous_serve_option_id
                 ):
-                    raise ValueError(
-                        '当前版本要求 low_decision_id 与 serve_option_id 一一对应'
-                    )
+                    agent.active_serve_has_matched = False
+                # 一个 High Serve option 可包含多个 Low 局部子决策，
+                # 因此两个 ID 必须分离：serve_option_id 在整个 High
+                # option 内稳定，low_decision_id 在每次重规划时更新。
                 # 训练流程始终提供 ID；旧 test/test_actor 推理脚本没有
                 # rollout，因此允许 -1 并仅跳过 Low 学习归因。
                 agent.active_low_decision_id = low_decision_id
@@ -358,6 +417,7 @@ class World:
                 agent.active_serve_option_id = -1
                 agent.active_low_candidate_id = -1
                 agent.active_low_started_step = -1
+                agent.active_serve_has_matched = False
             if mode == 'Recharge':
                 continue
             if mode == 'Wait':
@@ -383,6 +443,61 @@ class World:
                 agent.remain -= required_energy
                 agent.total_energy_consumed += required_energy
                 agent.total_cost += required_energy * RC_PRICE
+
+        mcs_by_id = {int(mcs.id): mcs for mcs in self.MCSs}
+        for ev_id, weights in pre_action_failure_opportunities.items():
+            causal_records: Dict[int, Dict] = {}
+            low_decisions: Dict[int, int] = {}
+            high_options: Dict[int, int] = {}
+            for raw_mcs_id, raw_weight in weights.items():
+                mcs_id = int(raw_mcs_id)
+                mcs = mcs_by_id.get(mcs_id)
+                action = action_by_mcs_id.get(mcs_id, {})
+                requested_mode = str(action.get(
+                    'requested_mode', getattr(mcs, 'active_high_mode', '')
+                ))
+                high_option_id = int(action.get(
+                    'high_option_id',
+                    getattr(mcs, 'active_high_option_id', -1),
+                ))
+                low_decision_id = int(action.get(
+                    'low_decision_id',
+                    getattr(mcs, 'active_low_decision_id', -1),
+                ))
+                if requested_mode == 'Recharge':
+                    cause_type = 'high_recharge_deferral'
+                    high_share, low_share = 1.0, 0.0
+                elif requested_mode == 'Serve' and low_decision_id >= 0:
+                    cause_type = (
+                        'low_wait_deferral'
+                        if bool(action.get('low_stay_selected', False))
+                        else 'low_reposition_deferral'
+                    )
+                    high_share, low_share = 0.0, 1.0
+                elif high_option_id >= 0:
+                    cause_type = 'high_unroutable_serve_deferral'
+                    high_share, low_share = 1.0, 0.0
+                else:
+                    cause_type = 'orphan_opportunity'
+                    high_share, low_share = 0.0, 0.0
+                low_decisions[mcs_id] = low_decision_id
+                high_options[mcs_id] = high_option_id
+                causal_records[mcs_id] = {
+                    'responsibility_weight': float(raw_weight),
+                    'high_option_id': high_option_id,
+                    'low_decision_id': low_decision_id,
+                    'requested_mode': requested_mode,
+                    'cause_type': cause_type,
+                    'high_share': float(high_share),
+                    'low_share': float(low_share),
+                }
+            self.failure_responsibility_history[ev_id] = {
+                'step': int(self.current_step),
+                'weights': dict(weights),
+                'low_decisions': low_decisions,
+                'high_options': high_options,
+                'causal_records': causal_records,
+            }
 
         for mcs in self.MCSs:
             if (
@@ -500,6 +615,9 @@ class World:
                 'has_quasi_candidate': bool(
                     action.get('has_quasi_candidate', False)
                 ),
+                'low_candidate_priority_reward': float(
+                    action.get('low_candidate_priority_reward', 0.0)
+                ),
                 'low_stay_selected': low_stay_selected,
                 'low_forced_stay': low_forced_stay,
                 'wait_duration_steps': (
@@ -518,6 +636,14 @@ class World:
                 'battery_delta_kwh': float(battery_delta),
                 'previous_remain_kwh': float(previous['remain']),
                 'current_remain_kwh': float(mcs.remain),
+                'profit_delta': float(
+                    mcs.total_profit - previous['total_profit']
+                ),
+                'cost_delta': float(
+                    mcs.total_cost - previous['total_cost']
+                ),
+                'previous_total_profit': float(previous['total_profit']),
+                'previous_total_cost': float(previous['total_cost']),
                 'previous_attraction': float(previous['spatial_attraction']),
                 'previous_competition': float(previous['spatial_competition']),
                 'previous_spatial_potential': float(previous['spatial_potential']),
@@ -540,21 +666,78 @@ class World:
                 'became_recharging': bool(mcs.is_recharging and not previous['is_recharging']),
                 'low_decision_id': int(mcs.active_low_decision_id),
                 'serve_option_id': int(mcs.active_serve_option_id),
+                'high_option_id': int(mcs.active_high_option_id),
+                'high_option_mode': str(mcs.active_high_mode),
             }
         self.mcs_step_events = events
         # 失败责任必须使用匹配前状态。匹配后 idle MCS 可能已接到其他任务，
         # 再回溯会把本应可控的失败错误归为外生失败。
         self.pending_failure_responsibilities = {}
+        self.pending_failure_low_decisions = {}
+        self.pending_failure_causal_records = {}
         for ev in self.EVs:
             previous_charged, previous_failed = self.ev_outcomes_before_step.get(
                 ev.id, (bool(ev.is_charged), bool(ev.fail_charge))
             )
             if ev.fail_charge and not previous_failed and not previous_charged:
-                self.pending_failure_responsibilities[ev.id] = (
-                    self.reward_builder.compute_failure_responsibility_weights(
+                history = self.failure_responsibility_history.get(ev.id)
+                history_age = (
+                    int(self.current_step) - int(history['step'])
+                    if history is not None else 10 ** 9
+                )
+                if (
+                    history is not None
+                    and history_age <= FAILURE_RESPONSIBILITY_MAX_AGE_STEPS
+                ):
+                    weights = dict(history['weights'])
+                    low_decisions = dict(history['low_decisions'])
+                    causal_records = {
+                        int(mcs_id): dict(record)
+                        for mcs_id, record in history.get(
+                            'causal_records', {}
+                        ).items()
+                    }
+                    for record in causal_records.values():
+                        record['attribution_age_steps'] = int(history_age)
+                else:
+                    weights = self.reward_builder.compute_failure_responsibility_weights(
                         ev, self.MCSs
                     )
-                )
+                    low_decisions = {}
+                    causal_records = {}
+                    for mcs_id, weight in weights.items():
+                        mcs = mcs_by_id.get(int(mcs_id))
+                        low_decision_id = int(getattr(
+                            mcs, 'active_low_decision_id', -1
+                        ))
+                        high_option_id = int(getattr(
+                            mcs, 'active_high_option_id', -1
+                        ))
+                        low_decisions[int(mcs_id)] = low_decision_id
+                        if low_decision_id >= 0:
+                            high_share, low_share = 0.0, 1.0
+                            cause_type = 'low_current_deferral'
+                        elif high_option_id >= 0:
+                            high_share, low_share = 1.0, 0.0
+                            cause_type = 'high_current_deferral'
+                        else:
+                            high_share, low_share = 0.0, 0.0
+                            cause_type = 'orphan_current_opportunity'
+                        causal_records[int(mcs_id)] = {
+                            'responsibility_weight': float(weight),
+                            'high_option_id': high_option_id,
+                            'low_decision_id': low_decision_id,
+                            'requested_mode': str(getattr(
+                                mcs, 'active_high_mode', ''
+                            )),
+                            'cause_type': cause_type,
+                            'high_share': high_share,
+                            'low_share': low_share,
+                            'attribution_age_steps': 0,
+                        }
+                self.pending_failure_responsibilities[ev.id] = weights
+                self.pending_failure_low_decisions[ev.id] = low_decisions
+                self.pending_failure_causal_records[ev.id] = causal_records
         self.current_step += 1
 
     # ============================================================
@@ -594,15 +777,26 @@ class World:
                 )
                 ev.feasible_mcs_count = feasible_mcs_count
                 ev.feasible_fcs_slot_count = feasible_fcs_slots
-                # 无可行 FCS 时权重为 1；可替代 slot 越多，MCS 的系统
-                # 边际贡献越小。该代理来自匹配 hard constraints。
-                ev.service_marginal_weight = float(
-                    1.0 / (1.0 + feasible_fcs_slots)
+                rescue_probability = float(np.clip(
+                    result.get('counterfactual_failure_probability', 0.0),
+                    0.0,
+                    1.0,
+                ))
+                # High/Low 的业务成功信用均使用同一个反事实救援价值；
+                # 层级差异由稳定 option/decision 路由负责，不再由两套替代
+                # 资源计数代理制造目标偏差。
+                ev.service_marginal_weight = rescue_probability
+                ev.low_service_marginal_weight = rescue_probability
+                ev.service_counterfactual_failure_probability = (
+                    rescue_probability
                 )
-                ev.low_service_marginal_weight = (
-                    self.reward_builder.compute_low_success_marginal_weight(
-                        feasible_fcs_slots, feasible_mcs_count
+                ev.service_success_credit = (
+                    self.reward_builder.compute_success_credit(
+                        rescue_probability
                     )
+                )
+                ev.service_rescue_diagnostics = dict(
+                    result.get('rescue_diagnostics', {})
                 )
             if result.get('provider_type') != 'MCS':
                 if ev is not None:
@@ -619,6 +813,7 @@ class World:
             if ev is not None:
                 ev.service_low_decision_id = low_decision_id
                 ev.service_serve_option_id = serve_option_id
+            provider.active_serve_has_matched = True
             event = self.mcs_step_events.get(result.get('provider_id'))
             if event is not None:
                 event['became_task'] = True
@@ -873,11 +1068,20 @@ class World:
             mcs.id: 0.0 for mcs in self.MCSs
         }
         low_success_weight_by_decision: Dict[int, float] = {}
+        high_success_weight_by_option: Dict[int, float] = {}
         low_failure_weight_by_decision: Dict[int, float] = {}
         self.last_low_event_records = []
         new_mcs_success_count = 0
         new_fcs_success_count = 0
         unattributed_mcs_success_count = 0
+        rescue_success_count = 0
+        replacement_success_count = 0
+        immediate_counterfactual_replacement_count = 0
+        future_rescue_evaluated_success_count = 0
+        success_base_credit_sum = 0.0
+        success_rescue_bonus_sum = 0.0
+        success_credit_sum = 0.0
+        counterfactual_failure_probability_sum = 0.0
         for ev in new_success_evs:
             if ev.charge_provider_type == 'MCS':
                 new_mcs_success_count += 1
@@ -894,6 +1098,36 @@ class World:
                     low_decision_id = int(getattr(
                         ev, 'service_low_decision_id', -1
                     ))
+                    success_credit = self.reward_builder.compute_success_credit(
+                        marginal_weight
+                    )
+                    success_base_credit_sum += MCS_SUCCESS_BASE_CREDIT
+                    rescue_bonus = MCS_SUCCESS_RESCUE_CREDIT * marginal_weight
+                    success_rescue_bonus_sum += rescue_bonus
+                    success_credit_sum += success_credit
+                    counterfactual_failure_probability_sum += marginal_weight
+                    rescue_diagnostics = dict(getattr(
+                        ev, 'service_rescue_diagnostics', {}
+                    ))
+                    if bool(rescue_diagnostics.get(
+                        'immediate_counterfactual_replacement', 0.0
+                    )):
+                        immediate_counterfactual_replacement_count += 1
+                    else:
+                        future_rescue_evaluated_success_count += 1
+                    if marginal_weight >= RESCUE_SUCCESS_THRESHOLD:
+                        rescue_success_count += 1
+                    else:
+                        replacement_success_count += 1
+                    serve_option_id = int(getattr(
+                        ev, 'service_serve_option_id', -1
+                    ))
+                    if serve_option_id >= 0:
+                        high_success_weight_by_option[serve_option_id] = (
+                            high_success_weight_by_option.get(
+                                serve_option_id, 0.0
+                            ) + marginal_weight
+                        )
                     if low_decision_id >= 0:
                         low_marginal_weight = float(np.clip(
                             getattr(
@@ -912,11 +1146,21 @@ class World:
                         'ev_id': int(ev.id),
                         'kind': 'mcs_success',
                         'low_decision_id': low_decision_id,
+                        'serve_option_id': serve_option_id,
                         'responsibility_weight': (
                             low_marginal_weight
                             if low_decision_id >= 0 else 0.0
                         ),
                         'high_responsibility_weight': marginal_weight,
+                        'counterfactual_failure_probability': marginal_weight,
+                        'success_base_credit': MCS_SUCCESS_BASE_CREDIT,
+                        'success_rescue_bonus': rescue_bonus,
+                        'success_credit': success_credit,
+                        'immediate_counterfactual_replacement': float(
+                            rescue_diagnostics.get(
+                                'immediate_counterfactual_replacement', 0.0
+                            )
+                        ),
                         'feasible_mcs_count': int(getattr(
                             ev, 'feasible_mcs_count', 0
                         )),
@@ -938,34 +1182,111 @@ class World:
         failure_weight_by_mcs_id: Dict[int, float] = {
             mcs.id: 0.0 for mcs in self.MCSs
         }
+        high_failure_weight_by_option: Dict[int, float] = {}
         controllable_failure_count = 0
         uncontrollable_failure_count = 0
+        historically_attributed_failure_count = 0
+        high_failure_route_count = 0
+        low_failure_route_count = 0
+        orphan_failure_route_count = 0
+        high_failure_weight_sum = 0.0
+        low_failure_weight_sum = 0.0
+        orphan_failure_weight_sum = 0.0
+        failure_attribution_age_weighted_sum = 0.0
+        failure_cause_counts: Dict[str, int] = {}
         for ev in new_failure_evs:
             weights = self.pending_failure_responsibilities.get(ev.id, {})
             if weights:
                 controllable_failure_count += 1
+                current_feasible = (
+                    self.reward_builder.compute_failure_responsibility_weights(
+                        ev, self.MCSs
+                    )
+                )
+                if not current_feasible:
+                    historically_attributed_failure_count += 1
                 low_event_weight_sum = 0.0
+                high_event_weight_sum = 0.0
+                orphan_event_weight_sum = 0.0
+                causal_records = self.pending_failure_causal_records.get(
+                    ev.id, {}
+                )
                 for mcs_id, weight in weights.items():
                     if mcs_id in failure_weight_by_mcs_id:
-                        failure_weight_by_mcs_id[mcs_id] += float(weight)
-                        low_decision_id = int(
-                            self.mcs_step_events.get(mcs_id, {}).get(
-                                'low_decision_id', -1
-                            )
+                        record = causal_records.get(int(mcs_id), {})
+                        age_steps = max(int(record.get(
+                            'attribution_age_steps', 0
+                        )), 0)
+                        decayed_weight = float(weight) * (
+                            FAILURE_RESPONSIBILITY_DECAY ** age_steps
                         )
-                        if low_decision_id >= 0:
+                        failure_weight_by_mcs_id[mcs_id] += decayed_weight
+                        failure_attribution_age_weighted_sum += (
+                            decayed_weight * age_steps
+                        )
+                        cause_type = str(record.get(
+                            'cause_type', 'unknown_opportunity'
+                        ))
+                        failure_cause_counts[cause_type] = (
+                            failure_cause_counts.get(cause_type, 0) + 1
+                        )
+                        high_option_id = int(record.get(
+                            'high_option_id', -1
+                        ))
+                        low_decision_id = int(record.get(
+                            'low_decision_id', -1
+                        ))
+                        high_share = float(np.clip(
+                            record.get('high_share', 0.0), 0.0, 1.0
+                        ))
+                        low_share = float(np.clip(
+                            record.get('low_share', 0.0), 0.0, 1.0
+                        ))
+                        high_weight = (
+                            decayed_weight * high_share
+                            if high_option_id >= 0 else 0.0
+                        )
+                        low_weight = (
+                            decayed_weight * low_share
+                            if low_decision_id >= 0 else 0.0
+                        )
+                        if high_weight > 0.0:
+                            high_failure_weight_by_option[high_option_id] = (
+                                high_failure_weight_by_option.get(
+                                    high_option_id, 0.0
+                                ) + high_weight
+                            )
+                            high_event_weight_sum += high_weight
+                            high_failure_route_count += 1
+                        if low_weight > 0.0:
                             low_failure_weight_by_decision[low_decision_id] = (
                                 low_failure_weight_by_decision.get(
                                     low_decision_id, 0.0
-                                ) + float(weight)
+                                ) + low_weight
                             )
-                            low_event_weight_sum += float(weight)
+                            low_event_weight_sum += low_weight
+                            low_failure_route_count += 1
+                        orphan_weight = max(
+                            decayed_weight - high_weight - low_weight, 0.0
+                        )
+                        orphan_event_weight_sum += orphan_weight
+                        if orphan_weight > 1e-12:
+                            orphan_failure_route_count += 1
                 self.last_low_event_records.append({
                     'ev_id': int(ev.id),
                     'kind': 'controllable_failure',
                     'low_decision_id': -1,
                     'responsibility_weight': float(low_event_weight_sum),
+                    'high_responsibility_weight': float(
+                        high_event_weight_sum
+                    ),
+                    'orphan_responsibility_weight': float(
+                        orphan_event_weight_sum
+                    ),
                 })
+                high_failure_weight_sum += high_event_weight_sum
+                low_failure_weight_sum += low_event_weight_sum
+                orphan_failure_weight_sum += orphan_event_weight_sum
             else:
                 uncontrollable_failure_count += 1
 
@@ -1010,10 +1331,49 @@ class World:
             'attributed_mcs_success_count': attributed_success_count,
             'attributed_mcs_success_weight_sum': success_weight_sum,
             'low_attributed_mcs_success_weight_sum': low_success_weight_sum,
+            'rescue_success_count': rescue_success_count,
+            'replacement_success_count': replacement_success_count,
+            'immediate_counterfactual_replacement_count': (
+                immediate_counterfactual_replacement_count
+            ),
+            'future_rescue_evaluated_success_count': (
+                future_rescue_evaluated_success_count
+            ),
+            'mcs_success_base_credit_sum': success_base_credit_sum,
+            'mcs_success_rescue_bonus_sum': success_rescue_bonus_sum,
+            'mcs_success_credit_sum': success_credit_sum,
+            'counterfactual_failure_probability_sum': (
+                counterfactual_failure_probability_sum
+            ),
             'controllable_failure_count': controllable_failure_count,
+            'historically_attributed_failure_count': (
+                historically_attributed_failure_count
+            ),
             'uncontrollable_failure_count': uncontrollable_failure_count,
+            'unattributed_iev_failure_count': uncontrollable_failure_count,
             'controllable_failure_weight_sum': failure_weight_sum,
+            'high_controllable_failure_weight_sum': (
+                high_failure_weight_sum
+            ),
             'low_controllable_failure_weight_sum': low_failure_weight_sum,
+            'orphan_controllable_failure_weight_sum': (
+                orphan_failure_weight_sum
+            ),
+            'high_failure_route_count': high_failure_route_count,
+            'low_failure_route_count': low_failure_route_count,
+            'orphan_failure_route_count': orphan_failure_route_count,
+            'failure_attribution_age_weighted_sum': (
+                failure_attribution_age_weighted_sum
+            ),
+            'failure_cause_high_recharge_count': failure_cause_counts.get(
+                'high_recharge_deferral', 0
+            ),
+            'failure_cause_low_wait_count': failure_cause_counts.get(
+                'low_wait_deferral', 0
+            ),
+            'failure_cause_low_reposition_count': failure_cause_counts.get(
+                'low_reposition_deferral', 0
+            ),
             'forced_wait_count': forced_wait_count,
             'voluntary_wait_count': voluntary_wait_count,
             'energy_stranded_count': energy_stranded_count,
@@ -1022,33 +1382,77 @@ class World:
         }
 
         self.last_mcs_reward_components = {}
-        self.last_low_reward_by_decision = {}
+        # 失败必须直接按稳定 decision/option ID 进入 rollout；不能先映射回
+        # 失败发生时的当前 MCS，否则关闭后的历史决策会再次丢失。
+        self.last_low_reward_by_decision = {
+            int(decision_id): self.reward_builder.compute_low_failure_reward(
+                weight
+            )
+            for decision_id, weight in low_failure_weight_by_decision.items()
+        }
+        self.last_high_reward_by_option = {
+            int(option_id): (
+                self.reward_builder.compute_high_success_reward(weight)
+            )
+            for option_id, weight in high_success_weight_by_option.items()
+        }
+        for option_id, weight in high_failure_weight_by_option.items():
+            self.last_high_reward_by_option[int(option_id)] = float(
+                self.last_high_reward_by_option.get(int(option_id), 0.0)
+                + self.reward_builder.compute_high_failure_reward(weight)
+            )
+        self.last_system_reward_event[
+            'high_routed_failure_reward_total'
+        ] = float(sum(
+            self.reward_builder.compute_high_failure_reward(weight)
+            for weight in high_failure_weight_by_option.values()
+        ))
+        self.last_system_reward_event[
+            'low_routed_failure_reward_total'
+        ] = float(sum(
+            self.reward_builder.compute_low_failure_reward(weight)
+            for weight in low_failure_weight_by_decision.values()
+        ))
         for mcs in self.MCSs:
             event = self.mcs_step_events.get(mcs.id, {})
+            # ImmediateMatcher 在 update() 之后、reward 之前确认服务与补电，
+            # 因此经济增量必须在此处用动作前快照重新计算，不能只看 update。
+            event['profit_delta'] = float(
+                mcs.total_profit
+                - float(event.get('previous_total_profit', mcs.total_profit))
+            )
+            event['cost_delta'] = float(
+                mcs.total_cost
+                - float(event.get('previous_total_cost', mcs.total_cost))
+            )
             attributed_success_count = mcs_success_count_by_id.get(mcs.id, 0)
             event['attributed_mcs_success_count'] = attributed_success_count
             event['attributed_mcs_success_weight'] = float(
                 mcs_success_weight_by_id.get(mcs.id, 0.0)
             )
-            event['controllable_failure_weight'] = float(
+            # 仅保留按 MCS 的责任权重用于审计；训练失败奖励已经按原始
+            # option/decision ID 直接路由，当前 option 分量必须为 0。
+            event['routed_controllable_failure_weight'] = float(
                 failure_weight_by_mcs_id.get(mcs.id, 0.0)
             )
+            event['controllable_failure_weight'] = 0.0
             event['controllable_failure_count'] = (
                 controllable_failure_count
             )
             event['uncontrollable_failure_count'] = (
                 uncontrollable_failure_count
             )
+            event['unattributed_iev_failure_count'] = (
+                uncontrollable_failure_count
+            )
+            event['mcs_team_size'] = max(len(self.MCSs), 1)
             event['fcs_success_kpi_count'] = new_fcs_success_count
             low_decision_id = int(event.get('low_decision_id', -1))
             event['low_attributed_mcs_success_weight'] = float(
                 low_success_weight_by_decision.get(low_decision_id, 0.0)
                 if low_decision_id >= 0 else 0.0
             )
-            event['low_controllable_failure_weight'] = float(
-                low_failure_weight_by_decision.get(low_decision_id, 0.0)
-                if low_decision_id >= 0 else 0.0
-            )
+            event['low_controllable_failure_weight'] = 0.0
             post_spatial = self.reward_builder.compute_mcs_spatial_features(
                 mcs, self.EVs, self.MCSs, self.FCSs
             )

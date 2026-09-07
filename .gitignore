@@ -1,0 +1,10 @@
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Jupyter runtime artifacts
+.ipynb_checkpoints/
+
+# IDE-local state
+.idea/csv-editor.xml
+

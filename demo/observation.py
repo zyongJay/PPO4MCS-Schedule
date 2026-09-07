@@ -32,6 +32,7 @@ MCS_LOW_CANDIDATE_FEATURE_NAMES = (
     'quasi_service_opportunity_ratio',
     'distance_ratio',
     'attraction_ratio',
+    'immediate_iev_attraction_ratio',
     'competition_mcs_ratio',
     'competition_fcs_ratio',
 )
@@ -45,6 +46,23 @@ class ObservationBuilder:
     为 MCS / IEV 智能体构建结构化观测 dict，
     结构兼容 env/world.py 的 get_agent_obs()。
     """
+
+    @staticmethod
+    def get_physically_reachable_fcss(
+        mcs: MCS,
+        all_fcss: List[FCS],
+    ) -> List[tuple[FCS, float, float]]:
+        """返回严格能量可达的全图物理 FCS，不考虑当前槽位。"""
+        reachable: List[tuple[FCS, float, float]] = []
+        for fcs in all_fcss:
+            distance_km = euclidean_distance(
+                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
+            ) / 1000.0
+            required_energy = distance_km * POWER_UNIT
+            if float(mcs.remain) > required_energy:
+                reachable.append((fcs, distance_km, required_energy))
+        reachable.sort(key=lambda item: item[1])
+        return reachable
 
     @staticmethod
     def get_reachable_serve_candidates(
@@ -109,23 +127,16 @@ class ObservationBuilder:
         """返回全图中当前有空闲槽且电量能够到达的 FCS。
 
         Recharge 是全图规划动作，不受 MCS 通信范围限制；通信范围仍只
-        用于局部空间观测和竞争特征。High mask 同时检查当前空闲槽和
-        物理能量可达性；多个 MCS 对同一槽位的竞争仍由 RechargeMatcher
-        在执行阶段全局处理。
+        用于局部空间观测和竞争特征。本函数只返回当前有空闲槽的
+        可执行匹配候选；High Recharge mask 则使用全部物理可达 FCS，
+        允许 Recharge option 在槽位竞争失败时保持并重试。
         """
-        reachable_fcss: List[tuple[FCS, float, float]] = []
-        for fcs in all_fcss:
-            if fcs.available_slots <= 0:
-                continue
-            distance_km = euclidean_distance(
-                mcs.pos[0], mcs.pos[1], fcs.pos[0], fcs.pos[1]
-            ) / 1000.0
-            required_energy = distance_km * POWER_UNIT
-            if float(mcs.remain) + 1e-12 >= required_energy:
-                reachable_fcss.append((fcs, distance_km, required_energy))
-
-        reachable_fcss.sort(key=lambda item: item[1])
-        return reachable_fcss
+        return [
+            item for item in ObservationBuilder.get_physically_reachable_fcss(
+                mcs, all_fcss
+            )
+            if item[0].available_slots > 0
+        ]
 
     def obs_mcs(self, mcs: MCS, all_fcss: Optional[List[FCS]] = None):
         """Build normalized local observations for the MCS high/low actors.
@@ -160,7 +171,7 @@ class ObservationBuilder:
             if all_fcss is not None
             else list(mcs.near_available_fcs) + list(mcs.near_busy_fcs)
         )
-        reachable_fcs = self.get_reachable_recharge_candidates(
+        physically_reachable_fcss = self.get_physically_reachable_fcss(
             mcs, recharge_fcss
         )
 
@@ -201,10 +212,8 @@ class ObservationBuilder:
         remain_ratio = float(np.clip(
             mcs.remain / max(MCS_BATTERY_CAPACITY, eps), 0.0, 1.0
         ))
-        if reachable_fcs:
-            _, nearest_dist_km, required_energy = min(
-                reachable_fcs, key=lambda item: item[1]
-            )
+        if physically_reachable_fcss:
+            _, nearest_dist_km, required_energy = physically_reachable_fcss[0]
             # 全图候选可能超过通信范围。用地图对角线归一化，避免所有
             # 远端 FCS 的距离特征都被裁剪为 1。
             map_diagonal_km = euclidean_distance(
@@ -243,9 +252,16 @@ class ObservationBuilder:
                 1.0,
             ),
         ], dtype=np.float32)
+        recharge_only = bool(
+            physically_reachable_fcss
+            and not float(mcs.remain) > (
+                float(MCS_SERVE_SAFETY_RESERVE_KWH)
+                + float(physically_reachable_fcss[0][2])
+            )
+        )
         high_action_mask = np.asarray([
-            True,                   # 0 = Serve；当前位置固定候选始终保底
-            bool(reachable_fcs),    # 1 = Recharge；要求有空闲槽且电量可达
+            not recharge_only,                  # 0 = Serve；只在绝对安全域内可用
+            bool(physically_reachable_fcss),    # 1 = Recharge；槽位竞争由匹配器处理
         ], dtype=bool)
 
         if TOP_K_MCS_CANDIDATES < 1:
@@ -258,6 +274,7 @@ class ObservationBuilder:
             stay_metrics['urgency_demand'],
             stay_metrics['distance_ratio'],
             stay_metrics['attraction'],
+            stay_metrics['immediate_iev_attraction'],
             stay_metrics['mcs_competition'],
             stay_metrics['fcs_competition'],
         ]]
@@ -273,6 +290,7 @@ class ObservationBuilder:
                 metrics['urgency_demand'],
                 metrics['distance_ratio'],
                 metrics['attraction'],
+                metrics['immediate_iev_attraction'],
                 metrics['mcs_competition'],
                 metrics['fcs_competition'],
             ])
@@ -305,6 +323,7 @@ class ObservationBuilder:
         return {
             'high_state': high_state,
             'high_action_mask': high_action_mask,
+            'high_recharge_only': recharge_only,
             'low_self_state': low_self_state,
             'low_candidates': low_candidates,
             'low_candidate_mask': low_candidate_mask,

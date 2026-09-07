@@ -1,0 +1,46 @@
+{
+  "version": "v10",
+  "episodes": 300,
+  "seed": 42,
+  "acceptance_result": "passed",
+  "acceptance_rule": "At least two consecutive 40-episode windows versus v14 with approximately +1 percentage point charging success and -2 average failures, without material MCS profit degradation.",
+  "consecutive_passing_windows": [
+    "81-120",
+    "121-160",
+    "161-200",
+    "201-240",
+    "241-280",
+    "261-300"
+  ],
+  "last_100": {
+    "charge_success_rate": 0.8239124521217029,
+    "average_failures": 49.38,
+    "average_mcs_successes": 152.46,
+    "average_fcs_successes": 78.62,
+    "average_total_mcs_profit": 4330.60629078107,
+    "delta_success_percentage_points_vs_v14": 1.2435077268538874,
+    "delta_failures_vs_v14": -3.489999999999995,
+    "delta_mcs_successes_vs_v14": 3.2900000000000205,
+    "delta_fcs_successes_vs_v14": 0.20000000000000284,
+    "delta_mcs_profit_vs_v14": 102.08390656065694,
+    "delta_success_percentage_points_vs_v11": 1.6536554489673505,
+    "delta_failures_vs_v11": -4.629999999999995
+  },
+  "best_checkpoint": {
+    "path": "best_model.pt",
+    "episode": 176,
+    "selected_rolling40_success_rate": 0.8317520657658711,
+    "selected_rolling40_average_mcs_profit": 431.4081628267498,
+    "selection": "rolling40 success, then profit within 0.002 success tolerance"
+  },
+  "highest_observed_rolling40_success_rate": 0.83302,
+  "final_rolling40_success_rate": 0.8239,
+  "last_100_audit": {
+    "selected_minus_available_immediate_iev_attraction": 0.0099,
+    "immediate_iev_attraction_reward_correlation": 0.1764,
+    "average_rescue_successes": 82.52,
+    "average_replacement_successes": 66.73,
+    "recharge_option_rate": 0.06,
+    "optional_recharge_option_rate": 0.0
+  }
+}

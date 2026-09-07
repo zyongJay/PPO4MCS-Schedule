@@ -25,6 +25,8 @@ import world as world_module
 from config import (
     EV_LOW_POWER_THRESHOLD,
     HIDDEN_DIM,
+    MAX_CONSECUTIVE_NO_CANDIDATE_LOW_REPLANS,
+    MAX_SERVE_OPTION_STEPS,
     MAX_STEPS_PER_EPISODE,
     MCS_CRITIC_STATE_DIM,
     MCS_FEAT_DIM_self,
@@ -35,22 +37,53 @@ from config import (
 )
 from core import EV, MCS
 from environment import MultiAgentEnv
-from matching import RechargeMatcher
+from matching import (
+    COUNTERFACTUAL_SUPPLY_HAZARD_SCALE,
+    RechargeMatcher,
+)
 from network import MCSMAPPOAgent
 from observation import MCS_STAY_CANDIDATE_ID
+from low_spatial import (
+    IEV_ATTRACTION_WEIGHT,
+    MCS_COMPETITION_IMPORTANCE,
+    QUASI_ATTRACTION_WEIGHT,
+)
 from reward import (
+    FAILURE_RESPONSIBILITY_DECAY,
+    FAILURE_RESPONSIBILITY_MAX_AGE_STEPS,
+    HIGH_CONTROLLABLE_FAILURE_SHARE,
+    HIGH_OPTION_TERMINATION_REWARDS,
+    HIGH_PROFIT_EVENT_WEIGHT,
+    LOW_CANDIDATE_PRIORITY_WEIGHT,
     LOW_EVENT_REWARD_WEIGHT,
     LOW_FCS_ALTERNATIVE_PENALTY,
     LOW_MCS_ALTERNATIVE_PENALTY,
     LOW_SPATIAL_OPPORTUNITY_WEIGHT,
     LOW_STEP_REWARD_WEIGHT,
+    LOW_PROFIT_EVENT_WEIGHT,
+    MCS_PROFIT_REFERENCE,
+    MCS_SUCCESS_BASE_CREDIT,
+    MCS_SUCCESS_RESCUE_CREDIT,
+    RECHARGE_ACTUAL_COST_WEIGHT,
+    RECHARGE_COST_REFERENCE,
+    RECHARGE_OPTION_BASE_COST,
+    RECHARGE_OPTION_DURATION_COST,
+    RECHARGE_OPTION_OPPORTUNITY_COST,
+    RECHARGE_OPTION_RISK_WEIGHT,
+    RECHARGE_OPTION_UNNECESSARY_COST,
+    RESCUE_SUCCESS_THRESHOLD,
     SERVE_MOVE_PENALTY,
+    SYSTEM_FAILURE_EVENT_PENALTY,
+    UNATTRIBUTED_IEV_FAILURE_TEAM_PENALTY,
+    RewardBuilder,
 )
 from rollout import HighOptionRolloutBuffer, LowServeRolloutBuffer
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR.parent / 'training_results'
 world_module.TRACK_DATA_PATH = str((SCRIPT_DIR / TRACK_DATA_PATH).resolve())
+CHECKPOINT_SELECTION_WINDOW = 40
+CHECKPOINT_SUCCESS_TOLERANCE = 0.002
 
 
 def critic_input(global_state: np.ndarray, high_state: np.ndarray) -> np.ndarray:
@@ -111,6 +144,9 @@ def ppo_update(
     low_critic_losses: List[float] = []
     high_entropies: List[float] = []
     low_entropies: List[float] = []
+    low_approx_kls: List[float] = []
+    low_clip_fractions: List[float] = []
+    low_actor_grad_norms: List[float] = []
 
     with torch.no_grad():
         high_ev = explained_variance(
@@ -122,10 +158,26 @@ def ppo_update(
     low_advantages = None
     low_sample_count = len(low_buffer)
     low_ev = 0.0
+    low_advantage_mean = 0.0
+    low_advantage_std = 0.0
+    low_advantage_positive_fraction = 0.0
+    low_normalized_entropy = 0.0
+    low_top1_probability = 0.0
+    low_top1_top2_probability_gap = 0.0
+    low_sample_greedy_consistency = 0.0
+    low_valid_action_count = 0.0
     if low_sample_count:
         low_data = low_buffer.as_tensors(agent.device)
         low_advantages = normalize_advantages(low_data['advantages'])
         with torch.no_grad():
+            raw_low_advantages = low_data['advantages']
+            low_advantage_mean = float(raw_low_advantages.mean().item())
+            low_advantage_std = float(
+                raw_low_advantages.std(unbiased=False).item()
+            )
+            low_advantage_positive_fraction = float(
+                (raw_low_advantages > 0.0).float().mean().item()
+            )
             low_ev = explained_variance(
                 low_data['returns'],
                 agent.low_values(
@@ -134,6 +186,49 @@ def ppo_update(
                     low_data['low_candidates'],
                     low_data['low_masks'],
                 ),
+            )
+            low_distribution = agent.low_actor.distribution(
+                low_data['low_self_states'],
+                low_data['low_candidates'],
+                low_data['low_masks'],
+            )
+            low_probabilities = low_distribution.probs
+            low_policy_entropy = low_distribution.entropy()
+            valid_action_counts = low_data['low_masks'].sum(dim=-1)
+            entropy_denominator = torch.log(
+                valid_action_counts.float().clamp_min(2.0)
+            )
+            normalized_entropy = torch.where(
+                valid_action_counts > 1,
+                low_policy_entropy / entropy_denominator,
+                torch.zeros_like(low_policy_entropy),
+            )
+            top_probabilities = torch.topk(
+                low_probabilities,
+                k=min(2, low_probabilities.shape[-1]),
+                dim=-1,
+            ).values
+            low_normalized_entropy = float(
+                normalized_entropy.mean().item()
+            )
+            low_top1_probability = float(
+                top_probabilities[:, 0].mean().item()
+            )
+            if top_probabilities.shape[-1] > 1:
+                low_top1_top2_probability_gap = float(
+                    (
+                        top_probabilities[:, 0]
+                        - top_probabilities[:, 1]
+                    ).mean().item()
+                )
+            low_sample_greedy_consistency = float(
+                (
+                    low_probabilities.argmax(dim=-1)
+                    == low_data['low_actions']
+                ).float().mean().item()
+            )
+            low_valid_action_count = float(
+                valid_action_counts.float().mean().item()
             )
 
     for _ in range(update_epochs):
@@ -204,6 +299,10 @@ def ppo_update(
                 new_low_log_probs
                 - low_data['old_low_log_probs'][indices]
             )
+            low_log_ratio = (
+                new_low_log_probs
+                - low_data['old_low_log_probs'][indices]
+            )
             low_surrogate = low_ratio * batch_advantages
             low_clipped = torch.clamp(
                 low_ratio, 1.0 - clip_ratio, 1.0 + clip_ratio
@@ -214,12 +313,20 @@ def ppo_update(
             )
             agent.low_optimizer.zero_grad()
             low_objective.backward()
-            torch.nn.utils.clip_grad_norm_(
+            low_actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                 agent.low_actor.parameters(), max_grad_norm
             )
             agent.low_optimizer.step()
             low_losses.append(float(low_loss.item()))
             low_entropies.append(float(low_entropy.mean().item()))
+            low_approx_kls.append(float(
+                ((low_ratio - 1.0) - low_log_ratio).mean().item()
+            ))
+            low_clip_fractions.append(float(
+                ((low_ratio - 1.0).abs() > clip_ratio)
+                .float().mean().item()
+            ))
+            low_actor_grad_norms.append(float(low_actor_grad_norm.item()))
 
             predictions = agent.low_values(
                 low_data['global_states'][indices],
@@ -257,6 +364,30 @@ def ppo_update(
         'high_frozen': int(not train_high),
         'high_entropy': float(np.mean(high_entropies)) if high_entropies else 0.0,
         'low_entropy': float(np.mean(low_entropies)) if low_entropies else 0.0,
+        'low_entropy_coef': float(low_entropy_coef),
+        'low_normalized_entropy': low_normalized_entropy,
+        'low_top1_probability': low_top1_probability,
+        'low_top1_top2_probability_gap': (
+            low_top1_top2_probability_gap
+        ),
+        'low_sample_greedy_consistency': low_sample_greedy_consistency,
+        'low_valid_action_count': low_valid_action_count,
+        'low_advantage_mean': low_advantage_mean,
+        'low_advantage_std': low_advantage_std,
+        'low_advantage_positive_fraction': (
+            low_advantage_positive_fraction
+        ),
+        'low_approx_kl': (
+            float(np.mean(low_approx_kls)) if low_approx_kls else 0.0
+        ),
+        'low_clip_fraction': (
+            float(np.mean(low_clip_fractions))
+            if low_clip_fractions else 0.0
+        ),
+        'low_actor_grad_norm': (
+            float(np.mean(low_actor_grad_norms))
+            if low_actor_grad_norms else 0.0
+        ),
     }
 
 
@@ -266,9 +397,13 @@ def append_high_option_log(
     buffer: HighOptionRolloutBuffer,
 ) -> None:
     fieldnames = [
-        'episode', 'mcs_id', 'high_action', 'duration_steps',
-        'option_reward', 'advantage', 'return_target', 'value',
-        'terminal', 'truncated', 'recharge_matched',
+        'episode', 'option_id', 'mcs_id', 'high_action', 'duration_steps',
+        'option_reward', 'boundary_reward', 'termination_reward',
+        'recharge_option_reward', 'recharge_risk_delta',
+        'option_event_reward', 'delayed_option_event_reward',
+        'start_remain_kwh', 'end_remain_kwh', 'start_serve_potential',
+        'advantage', 'return_target', 'value', 'next_value',
+        'terminal', 'truncated', 'recharge_matched', 'termination_reason',
     ]
     write_header = not path.exists()
     with path.open('a', newline='', encoding='utf-8') as handle:
@@ -278,16 +413,30 @@ def append_high_option_log(
         for item in buffer.transitions:
             writer.writerow({
                 'episode': episode,
+                'option_id': item.option_id,
                 'mcs_id': item.mcs_id,
                 'high_action': item.high_action,
                 'duration_steps': item.duration_steps,
                 'option_reward': item.option_reward,
+                'boundary_reward': item.boundary_reward,
+                'termination_reward': item.termination_reward,
+                'recharge_option_reward': item.recharge_option_reward,
+                'recharge_risk_delta': item.recharge_risk_delta,
+                'option_event_reward': item.option_event_reward,
+                'delayed_option_event_reward': (
+                    item.delayed_option_event_reward
+                ),
+                'start_remain_kwh': item.start_remain_kwh,
+                'end_remain_kwh': item.end_remain_kwh,
+                'start_serve_potential': item.start_serve_potential,
                 'advantage': item.advantage,
                 'return_target': item.return_target,
                 'value': item.value,
+                'next_value': item.next_value,
                 'terminal': item.terminal,
                 'truncated': item.truncated,
                 'recharge_matched': item.recharge_matched,
+                'termination_reason': item.termination_reason,
             })
 
 
@@ -297,19 +446,22 @@ def append_low_option_log(
     buffer: LowServeRolloutBuffer,
 ) -> None:
     fieldnames = [
-        'episode', 'decision_id', 'mcs_id', 'low_action',
+        'episode', 'decision_id', 'serve_option_id', 'mcs_id', 'low_action',
         'selected_candidate_id', 'stay_selected', 'forced_stay',
         'raw_quasi_count', 'safe_quasi_count', 'topk_truncated_count',
         'selected_urgency_rank', 'selected_urgency',
         'selected_remain_kwh', 'selected_need_power_kwh',
         'selected_distance_ratio', 'selected_attraction',
+        'selected_immediate_iev_attraction',
         'selected_mcs_competition', 'selected_fcs_competition',
         'selected_desirability', 'available_avg_attraction',
+        'available_avg_immediate_iev_attraction',
         'available_avg_mcs_competition',
         'available_avg_fcs_competition',
         'available_avg_desirability',
         'duration_steps', 'option_reward', 'delayed_reward',
-        'advantage', 'return_target', 'value', 'terminal', 'truncated',
+        'advantage', 'return_target', 'value', 'next_value',
+        'terminal', 'truncated', 'termination_reason',
     ]
     write_header = not path.exists()
     with path.open('a', newline='', encoding='utf-8') as handle:
@@ -320,6 +472,7 @@ def append_low_option_log(
             writer.writerow({
                 'episode': episode,
                 'decision_id': item.decision_id,
+                'serve_option_id': item.serve_option_id,
                 'mcs_id': item.mcs_id,
                 'low_action': item.low_action,
                 'selected_candidate_id': item.selected_candidate_id,
@@ -334,6 +487,9 @@ def append_low_option_log(
                 'selected_need_power_kwh': item.selected_need_power_kwh,
                 'selected_distance_ratio': item.selected_distance_ratio,
                 'selected_attraction': item.selected_attraction,
+                'selected_immediate_iev_attraction': (
+                    item.selected_immediate_iev_attraction
+                ),
                 'selected_mcs_competition': (
                     item.selected_mcs_competition
                 ),
@@ -342,6 +498,9 @@ def append_low_option_log(
                 ),
                 'selected_desirability': item.selected_desirability,
                 'available_avg_attraction': item.available_avg_attraction,
+                'available_avg_immediate_iev_attraction': (
+                    item.available_avg_immediate_iev_attraction
+                ),
                 'available_avg_mcs_competition': (
                     item.available_avg_mcs_competition
                 ),
@@ -357,13 +516,33 @@ def append_low_option_log(
                 'advantage': item.advantage,
                 'return_target': item.return_target,
                 'value': item.value,
+                'next_value': item.next_value,
                 'terminal': item.terminal,
                 'truncated': item.truncated,
+                'termination_reason': item.termination_reason,
             })
 
 
 def rolling(values: pd.Series, window: int) -> pd.Series:
     return values.rolling(window=max(window, 1), min_periods=1).mean()
+
+
+def checkpoint_selection_score(episode_rows: List[Dict]) -> float:
+    """返回给定评估窗口的平均充电成功率。"""
+    if not episode_rows:
+        raise ValueError('checkpoint selection 缺少 episode rows')
+    return float(np.mean([
+        float(row['charge_success_rate']) for row in episode_rows
+    ]))
+
+
+def checkpoint_selection_profit(episode_rows: List[Dict]) -> float:
+    """成功率容忍带内使用 MCS 收益作为第二选择目标。"""
+    if not episode_rows:
+        raise ValueError('checkpoint selection 缺少 episode rows')
+    return float(np.mean([
+        float(row['avg_mcs_profit']) for row in episode_rows
+    ]))
 
 
 def plot_convergence(log_table: pd.DataFrame, save_path: Path, window: int) -> None:
@@ -450,6 +629,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
     parser.add_argument('--low-gamma', type=float, default=0.99)
+    parser.add_argument('--low-gae-lambda', type=float, default=0.95)
+    parser.add_argument(
+        '--max-serve-option-steps',
+        type=int,
+        default=MAX_SERVE_OPTION_STEPS,
+    )
+    parser.add_argument(
+        '--max-no-candidate-low-replans',
+        type=int,
+        default=MAX_CONSECUTIVE_NO_CANDIDATE_LOW_REPLANS,
+    )
     parser.add_argument('--clip-ratio', type=float, default=0.2)
     parser.add_argument('--entropy-coef', type=float, default=0.01)
     parser.add_argument('--low-entropy-coef', type=float, default=0.01)
@@ -489,19 +679,33 @@ def collect_episode(
     recharge_matcher = RechargeMatcher()
     observations = env.reset()
     high_buffer = HighOptionRolloutBuffer(args.gamma, args.gae_lambda)
-    low_buffer = LowServeRolloutBuffer(args.low_gamma)
+    low_buffer = LowServeRolloutBuffer(
+        args.low_gamma, args.low_gae_lambda
+    )
     episode_high_reward = 0.0
     episode_low_reward = 0.0
+    next_high_option_serial = 1
     next_low_decision_serial = 1
     reward_component_names = (
         'system_success',
         'system_failure',
         'attributed_mcs_success',
+        'attributed_mcs_success_credit',
         'controllable_failure',
         'uncontrollable_failure',
+        'unattributed_iev_failure_count',
+        'unattributed_failure_team_penalty',
+        'unattributed_failure_team_penalty_weighted',
         'fcs_success_kpi',
         'attributed_mcs_success_weight',
+        'low_attributed_mcs_success_credit',
         'controllable_failure_weight',
+        'profit_delta',
+        'normalized_profit',
+        'high_profit_event',
+        'low_profit_event',
+        'recharge_cost_delta',
+        'recharge_actual_cost_penalty',
         'service',
         'serve_attraction',
         'serve_competition',
@@ -524,6 +728,8 @@ def collect_episode(
         'recharge_event',
         'broken_event',
         'high_total',
+        'high_attributed_success_weighted',
+        'high_current_option_total',
         'low_total',
         'low_step',
         'low_event',
@@ -531,6 +737,7 @@ def collect_episode(
         'low_event_weighted',
         'resource_gap_improvement',
         'low_spatial_opportunity_gain',
+        'low_candidate_priority_reward',
         'low_attraction_metric',
         'low_mcs_competition_metric',
         'low_fcs_competition_metric',
@@ -551,12 +758,34 @@ def collect_episode(
     action_counts = {'Serve': 0, 'Recharge': 0}
     recharge_request_count = 0
     recharge_match_count = 0
+    high_boundary_reward_total = 0.0
+    high_termination_reward_total = 0.0
+    high_recharge_option_reward_total = 0.0
+    high_recharge_risk_delta_total = 0.0
+    high_recharge_risk_reward_total = 0.0
+    high_recharge_base_cost_total = 0.0
+    high_recharge_duration_cost_total = 0.0
+    high_recharge_unnecessary_cost_total = 0.0
+    high_recharge_opportunity_cost_total = 0.0
+    forced_recharge_option_count = 0
+    high_termination_reason_counts: Dict[str, int] = {}
     event_audit_totals = {
         'attributed_mcs_success_count': 0,
         'attributed_mcs_success_weight_sum': 0.0,
+        'rescue_success_count': 0,
+        'replacement_success_count': 0,
+        'immediate_counterfactual_replacement_count': 0,
+        'future_rescue_evaluated_success_count': 0,
+        'mcs_success_base_credit_sum': 0.0,
+        'mcs_success_rescue_bonus_sum': 0.0,
+        'mcs_success_credit_sum': 0.0,
+        'counterfactual_failure_probability_sum': 0.0,
         'controllable_failure_weight_sum': 0.0,
+        'high_controllable_failure_weight_sum': 0.0,
         'controllable_failure_count': 0,
+        'historically_attributed_failure_count': 0,
         'uncontrollable_failure_count': 0,
+        'unattributed_iev_failure_count': 0,
         'fcs_success_kpi_count': 0,
         'unattributed_mcs_success_count': 0,
         'forced_wait_count': 0,
@@ -566,9 +795,100 @@ def collect_episode(
         'low_passive_wait_count': 0,
         'low_attributed_mcs_success_weight_sum': 0.0,
         'low_controllable_failure_weight_sum': 0.0,
+        'orphan_controllable_failure_weight_sum': 0.0,
+        'high_failure_route_count': 0,
+        'low_failure_route_count': 0,
+        'orphan_failure_route_count': 0,
+        'failure_attribution_age_weighted_sum': 0.0,
+        'failure_cause_high_recharge_count': 0,
+        'failure_cause_low_wait_count': 0,
+        'failure_cause_low_reposition_count': 0,
+        'high_routed_failure_reward_total': 0.0,
+        'low_routed_failure_reward_total': 0.0,
     }
     executed_steps = 0
     ev_by_id = {ev.id: ev for ev in env.world.EVs}
+
+    def build_high_boundary_rewards(
+        termination_reasons: Dict[int, str],
+    ) -> tuple[
+        Dict[int, float], Dict[int, float], Dict[int, float],
+        Dict[int, float], Dict[int, float],
+    ]:
+        """构造 High 边界奖励及审计数据，不产生逐 step Recharge 奖励。"""
+        nonlocal high_recharge_risk_reward_total
+        nonlocal high_recharge_base_cost_total
+        nonlocal high_recharge_duration_cost_total
+        nonlocal high_recharge_unnecessary_cost_total
+        nonlocal high_recharge_opportunity_cost_total
+        nonlocal forced_recharge_option_count
+        mcs_by_id = {mcs.id: mcs for mcs in env.world.MCSs}
+        boundary_rewards: Dict[int, float] = {}
+        termination_rewards: Dict[int, float] = {}
+        recharge_rewards: Dict[int, float] = {}
+        recharge_risk_deltas: Dict[int, float] = {}
+        end_remains: Dict[int, float] = {}
+        for mcs_id, reason in termination_reasons.items():
+            option = high_buffer.open_options.get(int(mcs_id))
+            mcs = mcs_by_id.get(int(mcs_id))
+            if option is None or mcs is None:
+                continue
+            end_remains[mcs_id] = float(mcs.remain)
+            termination_reward = (
+                env.world.reward_builder
+                .compute_high_option_termination_reward(
+                    reason,
+                    duration_steps=option.duration_steps,
+                    start_serve_potential=option.start_serve_potential,
+                )
+            )
+            recharge_reward = 0.0
+            recharge_risk_delta = 0.0
+            if option.high_action == 1:
+                forced_recharge = bool(
+                    option.high_mask.size > 0 and not option.high_mask[0]
+                )
+                recharge_result = (
+                    env.world.reward_builder.compute_recharge_option_reward(
+                        option.start_remain_kwh,
+                        float(mcs.remain),
+                        duration_steps=option.duration_steps,
+                        forced_recharge=forced_recharge,
+                        start_serve_potential=option.start_serve_potential,
+                    )
+                )
+                recharge_reward = float(recharge_result['reward'])
+                recharge_risk_delta = float(
+                    recharge_result['risk_delta']
+                )
+                high_recharge_risk_reward_total += float(
+                    recharge_result['risk_reward']
+                )
+                high_recharge_base_cost_total += float(
+                    recharge_result['base_cost']
+                )
+                high_recharge_duration_cost_total += float(
+                    recharge_result['duration_cost']
+                )
+                high_recharge_unnecessary_cost_total += float(
+                    recharge_result['unnecessary_cost']
+                )
+                high_recharge_opportunity_cost_total += float(
+                    recharge_result['opportunity_cost']
+                )
+                forced_recharge_option_count += int(forced_recharge)
+            total = termination_reward + recharge_reward
+            boundary_rewards[mcs_id] = float(total)
+            termination_rewards[mcs_id] = float(termination_reward)
+            recharge_rewards[mcs_id] = float(recharge_reward)
+            recharge_risk_deltas[mcs_id] = float(recharge_risk_delta)
+        return (
+            boundary_rewards,
+            termination_rewards,
+            recharge_rewards,
+            recharge_risk_deltas,
+            end_remains,
+        )
 
     for step_index in range(args.max_steps):
         acting_agents = list(env.world.agents)
@@ -581,76 +901,110 @@ def collect_episode(
         acting_mcss = [
             actor for actor in acting_agents if isinstance(actor, MCS)
         ]
-        mcs_observations = [
-            observation_by_agent[mcs] for mcs in acting_mcss
-        ]
-        # One High forward for all MCSs, followed by one Low forward for the
-        # Serve subset.  On CUDA these are two small batched GPU kernels.
-        mcs_actions = agent.select_mcs_actions_batch(mcs_observations)
 
-        sampled: Dict[int, Dict] = {}
-        recharge_requests: List[MCS] = []
-        value_state_by_id: Dict[int, np.ndarray] = {}
-        value_by_id: Dict[int, float] = {}
-        low_value_by_id: Dict[int, float] = {}
-        if acting_mcss:
-            value_states = np.stack([
+        # High 只在上一个 option 已终止时采样。
+        boundary_mcss = [
+            mcs for mcs in acting_mcss
+            if mcs.id not in high_buffer.open_options
+        ]
+        if boundary_mcss:
+            boundary_observations = [
+                observation_by_agent[mcs] for mcs in boundary_mcss
+            ]
+            boundary_actions = agent.select_high_actions_batch(
+                boundary_observations
+            )
+            boundary_states = np.stack([
                 critic_input(global_state, observation['high_state'])
-                for observation in mcs_observations
+                for observation in boundary_observations
             ])
-            value_batch = agent.get_high_values_batch(value_states)
+            boundary_values = agent.get_high_values_batch(boundary_states)
             for index, (mcs, observation, action) in enumerate(zip(
-                acting_mcss, mcs_observations, mcs_actions
+                boundary_mcss, boundary_observations, boundary_actions
             )):
-                sampled[mcs.id] = {
-                    'mcs': mcs,
-                    'observation': observation,
-                    'action': action,
-                }
-                value_state_by_id[mcs.id] = value_states[index]
-                value_by_id[mcs.id] = float(value_batch[index])
+                option_id = (
+                    int(episode) * 1_000_000 + next_high_option_serial
+                )
+                next_high_option_serial += 1
+                candidate_ids = np.asarray(
+                    observation.get('candidate_ids', []), dtype=int
+                )
+                candidate_mask = np.asarray(
+                    observation.get('low_candidate_mask', []), dtype=bool
+                )
+                candidate_desirabilities = np.asarray(
+                    observation.get('candidate_desirabilities', []),
+                    dtype=float,
+                )
+                valid_serve_candidates = (
+                    (candidate_ids >= 0)
+                    & candidate_mask
+                    & np.isfinite(candidate_desirabilities)
+                )
+                start_serve_potential = float(
+                    np.max(candidate_desirabilities[valid_serve_candidates])
+                    if np.any(valid_serve_candidates) else 0.0
+                )
+                high_buffer.start_option(
+                    option_id,
+                    mcs.id,
+                    observation,
+                    action,
+                    boundary_states[index],
+                    float(boundary_values[index]),
+                    False,
+                    start_remain_kwh=float(mcs.remain),
+                    start_serve_potential=start_serve_potential,
+                )
                 action_counts[action['mode']] += 1
                 if action['mode'] == 'Recharge':
-                    recharge_requests.append(mcs)
                     recharge_request_count += 1
 
-            serve_batch_indices = [
-                index for index, action in enumerate(mcs_actions)
-                if action['mode'] == 'Serve'
-            ]
-            if serve_batch_indices:
-                low_value_batch = agent.get_low_values_batch(
-                    np.stack([
-                        global_state for _index in serve_batch_indices
-                    ]),
-                    np.stack([
-                        mcs_observations[index]['low_self_state']
-                        for index in serve_batch_indices
-                    ]),
-                    np.stack([
-                        mcs_observations[index]['low_candidates']
-                        for index in serve_batch_indices
-                    ]),
-                    np.stack([
-                        mcs_observations[index]['low_candidate_mask']
-                        for index in serve_batch_indices
-                    ]),
-                )
-                for batch_index, observation_index in enumerate(
-                    serve_batch_indices
-                ):
-                    low_value_by_id[
-                        acting_mcss[observation_index].id
-                    ] = float(low_value_batch[batch_index])
+        active_serve_mcss = [
+            mcs for mcs in acting_mcss
+            if high_buffer.mode(mcs.id) == 'Serve'
+        ]
+        serve_observations = [
+            observation_by_agent[mcs] for mcs in active_serve_mcss
+        ]
+        low_action_by_id: Dict[int, Dict] = {}
+        low_value_by_id: Dict[int, float] = {}
+        if active_serve_mcss:
+            low_actions = agent.select_low_actions_batch(serve_observations)
+            low_values = agent.get_low_values_batch(
+                np.stack([
+                    global_state for _mcs in active_serve_mcss
+                ]),
+                np.stack([
+                    observation['low_self_state']
+                    for observation in serve_observations
+                ]),
+                np.stack([
+                    observation['low_candidates']
+                    for observation in serve_observations
+                ]),
+                np.stack([
+                    observation['low_candidate_mask']
+                    for observation in serve_observations
+                ]),
+            )
+            for index, mcs in enumerate(active_serve_mcss):
+                low_action_by_id[mcs.id] = low_actions[index]
+                low_value_by_id[mcs.id] = float(low_values[index])
 
+        # 未匹配的 Recharge option 保持激活，每个空闲 step 重试。
+        recharge_requests = [
+            mcs for mcs in acting_mcss
+            if high_buffer.mode(mcs.id) == 'Recharge'
+        ]
         recharge_results = recharge_matcher.match_all(
             recharge_requests, env.world.FCSs
         )
         recharge_matched_ids = {
-            result['mcs_id']
-            for result in recharge_results
-            if result.get('success')
+            int(result['mcs_id'])
+            for result in recharge_results if result.get('success')
         }
+        high_buffer.mark_recharge_matched(recharge_matched_ids)
         recharge_match_count += len(recharge_matched_ids)
 
         action_n = []
@@ -659,97 +1013,145 @@ def collect_episode(
                 action_n.append(iev_track_action(actor))
                 continue
 
-            decision = sampled[actor.id]
-            observation = decision['observation']
-            action = decision['action']
-            matched = actor.id in recharge_matched_ids
-            high_buffer.start_option(
-                actor.id,
-                observation,
-                action,
-                value_state_by_id[actor.id],
-                value_by_id[actor.id],
-                matched,
-            )
-
-            if action['mode'] == 'Recharge':
-                if matched:
-                    action_n.append({
-                        'mode': 'Recharge',
-                        'requested_mode': 'Recharge',
-                        'recharge_matched': True,
-                        'high_action_mask': observation[
-                            'high_action_mask'
-                        ].tolist(),
-                        'target_pos': list(actor.current_target_pos),
-                    })
-                else:
-                    action_n.append({
-                        'mode': 'Wait',
-                        'requested_mode': 'Recharge',
-                        'recharge_matched': False,
-                        'high_action_mask': observation[
-                            'high_action_mask'
-                        ].tolist(),
-                        'target_pos': list(actor.pos),
-                    })
-            else:
-                candidate_index = action['low_action']
-                candidate_id = int(
-                    observation['candidate_ids'][candidate_index]
-                )
-                low_stay_selected = candidate_id == MCS_STAY_CANDIDATE_ID
-                has_quasi_candidate = bool(
-                    observation.get('quasi_candidate_count', 0) > 0
-                )
-                low_forced_stay = bool(
-                    low_stay_selected and not has_quasi_candidate
-                )
-                low_decision_id = (
-                    int(episode) * 1_000_000 + next_low_decision_serial
-                )
-                next_low_decision_serial += 1
-                low_buffer.start_option(
-                    low_decision_id,
-                    actor.id,
-                    observation,
-                    action,
-                    global_state,
-                    low_value_by_id[actor.id],
-                )
-                target_pos = (
-                    list(actor.pos)
-                    if low_stay_selected
-                    else list(ev_by_id[candidate_id].pos)
-                )
+            observation = observation_by_agent[actor]
+            option_mode = high_buffer.mode(actor.id)
+            if option_mode == 'Recharge':
+                matched = actor.id in recharge_matched_ids
                 action_n.append({
-                    'mode': 'Serve',
-                    'requested_mode': 'Serve',
-                    'recharge_matched': False,
+                    'mode': 'Recharge' if matched else 'Wait',
+                    'requested_mode': 'Recharge',
+                    'recharge_matched': matched,
                     'high_action_mask': observation[
                         'high_action_mask'
                     ].tolist(),
-                    'target_pos': target_pos,
-                    'low_decision_id': low_decision_id,
-                    'serve_option_id': low_decision_id,
-                    'low_candidate_id': candidate_id,
-                    'low_stay_selected': low_stay_selected,
-                    'low_forced_stay': low_forced_stay,
-                    'has_quasi_candidate': has_quasi_candidate,
+                    'high_option_id': high_buffer.option_id(actor.id),
+                    'target_pos': (
+                        list(actor.current_target_pos)
+                        if matched else list(actor.pos)
+                    ),
                 })
+                continue
+
+            action = low_action_by_id[actor.id]
+            candidate_index = int(action['low_action'])
+            candidate_id = int(
+                observation['candidate_ids'][candidate_index]
+            )
+            low_stay_selected = candidate_id == MCS_STAY_CANDIDATE_ID
+            candidate_ids = np.asarray(
+                observation['candidate_ids'], dtype=np.int64
+            )
+            candidate_mask = np.asarray(
+                observation['low_candidate_mask'], dtype=bool
+            )
+            candidate_urgencies = np.asarray(
+                observation.get(
+                    'candidate_urgencies',
+                    np.zeros_like(candidate_ids, dtype=float),
+                ),
+                dtype=float,
+            )
+            candidate_attractions = np.asarray(
+                observation['low_candidates'], dtype=float
+            )[:, 2]
+            candidate_immediate_iev_attractions = np.asarray(
+                observation['low_candidates'], dtype=float
+            )[:, 3]
+            valid_quasi = candidate_mask & (candidate_ids >= 0)
+            available_avg_urgency = float(
+                np.mean(candidate_urgencies[valid_quasi])
+                if np.any(valid_quasi) else 0.0
+            )
+            available_avg_attraction = float(
+                np.mean(candidate_attractions[valid_quasi])
+                if np.any(valid_quasi) else 0.0
+            )
+            available_avg_immediate_iev_attraction = float(
+                np.mean(candidate_immediate_iev_attractions[valid_quasi])
+                if np.any(valid_quasi) else 0.0
+            )
+            low_candidate_priority_reward = (
+                RewardBuilder.compute_low_candidate_priority_reward(
+                    candidate_urgencies[candidate_index],
+                    candidate_attractions[candidate_index],
+                    available_avg_urgency,
+                    available_avg_attraction,
+                    selected_immediate_iev_attraction=(
+                        candidate_immediate_iev_attractions[candidate_index]
+                    ),
+                    available_avg_immediate_iev_attraction=(
+                        available_avg_immediate_iev_attraction
+                    ),
+                    stay_selected=low_stay_selected,
+                )
+            )
+            has_quasi_candidate = bool(
+                observation.get('quasi_candidate_count', 0) > 0
+            )
+            high_buffer.record_low_replan(
+                actor.id, has_quasi_candidate
+            )
+            low_forced_stay = bool(
+                low_stay_selected and not has_quasi_candidate
+            )
+            low_decision_id = (
+                int(episode) * 1_000_000 + next_low_decision_serial
+            )
+            next_low_decision_serial += 1
+            serve_option_id = high_buffer.option_id(actor.id)
+            low_buffer.start_option(
+                low_decision_id,
+                serve_option_id,
+                actor.id,
+                observation,
+                action,
+                global_state,
+                low_value_by_id[actor.id],
+            )
+            target_pos = (
+                list(actor.pos)
+                if low_stay_selected
+                else list(ev_by_id[candidate_id].pos)
+            )
+            action_n.append({
+                'mode': 'Serve',
+                'requested_mode': 'Serve',
+                'recharge_matched': False,
+                'high_action_mask': observation[
+                    'high_action_mask'
+                ].tolist(),
+                'target_pos': target_pos,
+                'low_decision_id': low_decision_id,
+                'serve_option_id': serve_option_id,
+                'high_option_id': serve_option_id,
+                'low_candidate_id': candidate_id,
+                'low_stay_selected': low_stay_selected,
+                'low_forced_stay': low_forced_stay,
+                'has_quasi_candidate': has_quasi_candidate,
+                'low_candidate_priority_reward': (
+                    low_candidate_priority_reward
+                ),
+            })
 
         new_observations, _, _, _ = env.step(action_n)
         executed_steps += 1
         high_reward_by_mcs = {
             mcs.id: env.world.last_mcs_reward_components[mcs.id][
-                'high_total'
+                'high_current_option_total'
             ]
             for mcs in env.world.MCSs
+            if mcs.id in high_buffer.open_options
         }
+        high_reward_by_option = dict(
+            env.world.last_high_reward_by_option
+        )
         low_reward_by_decision = dict(
             env.world.last_low_reward_by_decision
         )
-        episode_high_reward += sum(high_reward_by_mcs.values())
+        episode_high_reward += (
+            sum(high_reward_by_mcs.values())
+            + sum(high_reward_by_option.values())
+        )
         episode_low_reward += sum(low_reward_by_decision.values())
         for components in env.world.last_mcs_reward_components.values():
             for name in reward_component_names:
@@ -760,6 +1162,9 @@ def collect_episode(
             event_audit_totals[name] += env.world.last_system_reward_event.get(
                 name, 0
             )
+        # 成功事件必须先按原始 serve_option_id 写入，再推进当前 option
+        # 的 step 折扣；这也允许已经关闭的 Serve 接收延迟成功事件。
+        high_buffer.add_option_event_rewards(high_reward_by_option)
         high_buffer.add_step_rewards(high_reward_by_mcs)
         low_buffer.add_step_rewards(low_reward_by_decision)
 
@@ -774,40 +1179,260 @@ def collect_episode(
             actor for actor in next_agents if isinstance(actor, MCS)
         ]
         ready_ids = {mcs.id for mcs in ready_mcss}
-        next_states: Dict[int, np.ndarray] = {}
-        next_values: Dict[int, float] = {}
-        if ready_mcss:
-            ready_state_batch = np.stack([
-                critic_input(
-                    next_global_state,
-                    next_observation_by_agent[mcs]['high_state'],
-                )
-                for mcs in ready_mcss
-            ])
-            ready_value_batch = agent.get_high_values_batch(ready_state_batch)
-            for index, mcs in enumerate(ready_mcss):
-                next_states[mcs.id] = ready_state_batch[index]
-                next_values[mcs.id] = float(ready_value_batch[index])
-
         terminal_mcs_ids = {
             mcs.id for mcs in env.world.MCSs
             if mcs.is_broken or mcs.is_energy_stranded
         }
-        final_step = step_index + 1 >= args.max_steps or env.world.get_done()
-        high_buffer.close_options(
-            decision_ready_ids=ready_ids,
-            next_critic_states=next_states,
-            next_values=next_values,
-            terminal_ids=terminal_mcs_ids,
-            close_all=final_step,
-            truncated=final_step,
+        high_buffer.mark_task_started({
+            mcs.id for mcs in env.world.MCSs if mcs.is_task
+        })
+        time_limit_truncated = step_index + 1 >= args.max_steps
+        environment_terminal = bool(
+            env.world.get_done() and not time_limit_truncated
         )
-        low_buffer.close_options(
-            decision_ready_ids=ready_ids,
-            terminal_ids=terminal_mcs_ids,
-            close_all=final_step,
-            truncated=final_step,
-        )
+        final_step = time_limit_truncated or environment_terminal
+
+        def build_mcs_observation(mcs: MCS) -> Dict:
+            return next_observation_by_agent.get(
+                mcs,
+                env.world.obs_builder.obs_mcs(mcs, env.world.FCSs),
+            )
+
+        if final_step:
+            nonterminal_open_mcss = [
+                mcs for mcs in env.world.MCSs
+                if mcs.id in high_buffer.open_options
+                and mcs.id not in terminal_mcs_ids
+            ]
+            final_observations = {
+                mcs.id: build_mcs_observation(mcs)
+                for mcs in nonterminal_open_mcss
+            }
+            final_states = {
+                mcs.id: critic_input(
+                    next_global_state,
+                    final_observations[mcs.id]['high_state'],
+                )
+                for mcs in nonterminal_open_mcss
+            }
+            final_high_values: Dict[int, float] = {}
+            if final_states:
+                values = agent.get_high_values_batch(np.stack([
+                    final_states[mcs.id] for mcs in nonterminal_open_mcss
+                ]))
+                final_high_values = {
+                    mcs.id: float(values[index])
+                    for index, mcs in enumerate(nonterminal_open_mcss)
+                }
+
+            low_bootstrap_ids = (
+                low_buffer.bootstrap_mcs_ids() - terminal_mcs_ids
+            )
+            low_bootstrap_mcss = [
+                mcs for mcs in env.world.MCSs
+                if mcs.id in low_bootstrap_ids
+            ]
+            final_low_values: Dict[int, float] = {}
+            if low_bootstrap_mcss:
+                low_observations = [
+                    build_mcs_observation(mcs)
+                    for mcs in low_bootstrap_mcss
+                ]
+                values = agent.get_low_values_batch(
+                    np.stack([
+                        next_global_state for _mcs in low_bootstrap_mcss
+                    ]),
+                    np.stack([
+                        obs['low_self_state'] for obs in low_observations
+                    ]),
+                    np.stack([
+                        obs['low_candidates'] for obs in low_observations
+                    ]),
+                    np.stack([
+                        obs['low_candidate_mask'] for obs in low_observations
+                    ]),
+                )
+                final_low_values = {
+                    mcs.id: float(values[index])
+                    for index, mcs in enumerate(low_bootstrap_mcss)
+                }
+
+            low_buffer.close_options(
+                decision_ready_ids=(),
+                next_values=final_low_values,
+                terminal_ids=terminal_mcs_ids,
+                close_all=True,
+                truncated=time_limit_truncated,
+            )
+            final_close_reasons = {
+                mcs_id: (
+                    'terminal' if mcs_id in terminal_mcs_ids
+                    else 'truncated'
+                )
+                for mcs_id in high_buffer.open_options
+            }
+            (
+                boundary_rewards,
+                termination_rewards,
+                recharge_rewards,
+                recharge_risk_deltas,
+                final_end_remains,
+            ) = build_high_boundary_rewards(final_close_reasons)
+            high_buffer.add_boundary_rewards(
+                boundary_rewards,
+                termination_rewards,
+                recharge_rewards,
+                recharge_risk_deltas,
+            )
+            high_boundary_reward_total += sum(boundary_rewards.values())
+            high_termination_reward_total += sum(
+                termination_rewards.values()
+            )
+            high_recharge_option_reward_total += sum(
+                recharge_rewards.values()
+            )
+            high_recharge_risk_delta_total += sum(
+                recharge_risk_deltas.values()
+            )
+            episode_high_reward += sum(boundary_rewards.values())
+            for reason in final_close_reasons.values():
+                high_termination_reason_counts[reason] = (
+                    high_termination_reason_counts.get(reason, 0) + 1
+                )
+            high_buffer.close_options(
+                decision_ready_ids=(),
+                next_critic_states=final_states,
+                next_values=final_high_values,
+                terminal_ids=terminal_mcs_ids,
+                termination_reasons=final_close_reasons,
+                end_remain_by_mcs_id=final_end_remains,
+                close_all=True,
+                truncated=time_limit_truncated,
+            )
+        else:
+            # 每个 Low 子决策以下一次空闲重规划点为边界。
+            low_buffer.close_options(
+                decision_ready_ids=ready_ids,
+                terminal_ids=terminal_mcs_ids,
+            )
+
+            close_reasons: Dict[int, str] = {}
+            mcs_by_id = {mcs.id: mcs for mcs in env.world.MCSs}
+            for mcs_id, option in list(high_buffer.open_options.items()):
+                mcs = mcs_by_id[mcs_id]
+                if mcs_id in terminal_mcs_ids:
+                    close_reasons[mcs_id] = 'terminal'
+                    continue
+                if option.high_action == 1:
+                    if option.recharge_matched and mcs.is_idle:
+                        close_reasons[mcs_id] = 'recharge_completed'
+                    continue
+                if option.task_started and mcs.is_idle:
+                    close_reasons[mcs_id] = 'serve_completed'
+                    continue
+                if (
+                    option.duration_steps >= args.max_serve_option_steps
+                ):
+                    close_reasons[mcs_id] = (
+                        'serve_timeout_after_match'
+                        if option.task_started
+                        else 'serve_timeout_before_match'
+                    )
+                    continue
+                if (
+                    not option.task_started
+                    and option.consecutive_no_candidate_replans
+                    >= args.max_no_candidate_low_replans
+                ):
+                    close_reasons[mcs_id] = 'no_candidate_replans'
+                    continue
+                if mcs.is_idle:
+                    next_obs = build_mcs_observation(mcs)
+                    if bool(next_obs.get('high_recharge_only', False)):
+                        close_reasons[mcs_id] = 'recharge_only'
+
+            (
+                boundary_rewards,
+                termination_rewards,
+                recharge_rewards,
+                recharge_risk_deltas,
+                close_end_remains,
+            ) = build_high_boundary_rewards(close_reasons)
+            high_buffer.add_boundary_rewards(
+                boundary_rewards,
+                termination_rewards,
+                recharge_rewards,
+                recharge_risk_deltas,
+            )
+            high_boundary_reward_total += sum(boundary_rewards.values())
+            high_termination_reward_total += sum(
+                termination_rewards.values()
+            )
+            high_recharge_option_reward_total += sum(
+                recharge_rewards.values()
+            )
+            high_recharge_risk_delta_total += sum(
+                recharge_risk_deltas.values()
+            )
+            episode_high_reward += sum(boundary_rewards.values())
+            for reason in close_reasons.values():
+                high_termination_reason_counts[reason] = (
+                    high_termination_reason_counts.get(reason, 0) + 1
+                )
+
+            # Serve 可能在 MCS 仍执行任务时因总时长超限而终止。先把该
+            # High option 下仍打开的 Low 子决策封口，再切断 Low GAE 链；
+            # 后续延迟到达的业务结果仍可按 decision_id 回写原 transition。
+            closing_serve_mcs_ids = [
+                mcs_id for mcs_id in close_reasons
+                if high_buffer.open_options[mcs_id].high_action == 0
+            ]
+            low_buffer.close_options(
+                decision_ready_ids=closing_serve_mcs_ids,
+                terminal_ids=terminal_mcs_ids,
+            )
+
+            # High Serve 终止同时切断其 Low GAE 链。
+            for mcs_id, reason in close_reasons.items():
+                option = high_buffer.open_options[mcs_id]
+                if option.high_action == 0:
+                    low_buffer.terminate_serve_options(
+                        [option.option_id], reason
+                    )
+
+            nonterminal_close_mcss = [
+                mcs_by_id[mcs_id] for mcs_id in close_reasons
+                if mcs_id not in terminal_mcs_ids
+            ]
+            close_observations = {
+                mcs.id: build_mcs_observation(mcs)
+                for mcs in nonterminal_close_mcss
+            }
+            close_states = {
+                mcs.id: critic_input(
+                    next_global_state,
+                    close_observations[mcs.id]['high_state'],
+                )
+                for mcs in nonterminal_close_mcss
+            }
+            close_values: Dict[int, float] = {}
+            if nonterminal_close_mcss:
+                values = agent.get_high_values_batch(np.stack([
+                    close_states[mcs.id]
+                    for mcs in nonterminal_close_mcss
+                ]))
+                close_values = {
+                    mcs.id: float(values[index])
+                    for index, mcs in enumerate(nonterminal_close_mcss)
+                }
+            high_buffer.close_options(
+                decision_ready_ids=close_reasons,
+                next_critic_states=close_states,
+                next_values=close_values,
+                terminal_ids=terminal_mcs_ids,
+                termination_reasons=close_reasons,
+                end_remain_by_mcs_id=close_end_remains,
+            )
         observations = new_observations
         if final_step:
             break
@@ -890,6 +1515,11 @@ def collect_episode(
     selected_minus_available_attraction = transition_mean(
         moving_low_transitions, 'selected_attraction'
     ) - transition_mean(moving_low_transitions, 'available_avg_attraction')
+    selected_minus_available_immediate_iev_attraction = transition_mean(
+        moving_low_transitions, 'selected_immediate_iev_attraction'
+    ) - transition_mean(
+        moving_low_transitions, 'available_avg_immediate_iev_attraction'
+    )
     selected_minus_available_mcs_competition = transition_mean(
         moving_low_transitions, 'selected_mcs_competition'
     ) - transition_mean(
@@ -957,6 +1587,9 @@ def collect_episode(
         'avg_low_selected_attraction': transition_mean(
             moving_low_transitions, 'selected_attraction'
         ),
+        'avg_low_selected_immediate_iev_attraction': transition_mean(
+            moving_low_transitions, 'selected_immediate_iev_attraction'
+        ),
         'avg_low_selected_mcs_competition': transition_mean(
             moving_low_transitions, 'selected_mcs_competition'
         ),
@@ -969,6 +1602,10 @@ def collect_episode(
         'avg_low_available_attraction': transition_mean(
             moving_low_transitions, 'available_avg_attraction'
         ),
+        'avg_low_available_immediate_iev_attraction': transition_mean(
+            moving_low_transitions,
+            'available_avg_immediate_iev_attraction',
+        ),
         'avg_low_available_mcs_competition': transition_mean(
             moving_low_transitions, 'available_avg_mcs_competition'
         ),
@@ -980,6 +1617,9 @@ def collect_episode(
         ),
         'low_selected_minus_available_attraction': (
             selected_minus_available_attraction
+        ),
+        'low_selected_minus_available_immediate_iev_attraction': (
+            selected_minus_available_immediate_iev_attraction
         ),
         'low_selected_minus_available_mcs_competition': (
             selected_minus_available_mcs_competition
@@ -1007,6 +1647,12 @@ def collect_episode(
         'low_selected_urgency_reward_corr': transition_correlation(
             moving_low_transitions, 'selected_urgency'
         ),
+        'low_selected_immediate_iev_attraction_reward_corr': (
+            transition_correlation(
+                moving_low_transitions,
+                'selected_immediate_iev_attraction',
+            )
+        ),
         'low_selected_need_power_reward_corr': transition_correlation(
             moving_low_transitions, 'selected_need_power_kwh'
         ),
@@ -1022,12 +1668,80 @@ def collect_episode(
         ),
         'serve_option_count': action_counts['Serve'],
         'recharge_option_count': action_counts['Recharge'],
+        'serve_option_rate': (
+            action_counts['Serve']
+            / max(action_counts['Serve'] + action_counts['Recharge'], 1)
+        ),
+        'recharge_option_rate': (
+            action_counts['Recharge']
+            / max(action_counts['Serve'] + action_counts['Recharge'], 1)
+        ),
+        'optional_recharge_option_count': (
+            action_counts['Recharge'] - forced_recharge_option_count
+        ),
+        'optional_recharge_option_rate': (
+            (action_counts['Recharge'] - forced_recharge_option_count)
+            / max(action_counts['Serve'] + action_counts['Recharge'], 1)
+        ),
         # High Wait 已移除；保留旧列便于历史CSV拼接。
         'wait_option_count': 0,
         'recharge_match_count': recharge_match_count,
         'recharge_match_rate': (
             recharge_match_count / recharge_request_count
             if recharge_request_count else 0.0
+        ),
+        'high_boundary_reward_total': high_boundary_reward_total,
+        'high_termination_reward_total': high_termination_reward_total,
+        'high_recharge_option_reward_total': (
+            high_recharge_option_reward_total
+        ),
+        'high_recharge_risk_delta_total': high_recharge_risk_delta_total,
+        'high_recharge_risk_reward_total': (
+            high_recharge_risk_reward_total
+        ),
+        'high_recharge_base_cost_total': high_recharge_base_cost_total,
+        'high_recharge_duration_cost_total': (
+            high_recharge_duration_cost_total
+        ),
+        'high_recharge_unnecessary_cost_total': (
+            high_recharge_unnecessary_cost_total
+        ),
+        'high_recharge_opportunity_cost_total': (
+            high_recharge_opportunity_cost_total
+        ),
+        'forced_recharge_option_count': forced_recharge_option_count,
+        'high_option_event_reward_total': float(sum(
+            item.option_event_reward for item in high_buffer.transitions
+        )),
+        'high_delayed_option_event_reward_total': float(sum(
+            item.delayed_option_event_reward
+            for item in high_buffer.transitions
+        )),
+        'serve_completed_option_count': high_termination_reason_counts.get(
+            'serve_completed', 0
+        ),
+        'serve_timeout_before_match_count': (
+            high_termination_reason_counts.get(
+                'serve_timeout_before_match', 0
+            )
+        ),
+        'serve_timeout_after_match_count': (
+            high_termination_reason_counts.get(
+                'serve_timeout_after_match', 0
+            )
+        ),
+        'no_candidate_replans_option_count': (
+            high_termination_reason_counts.get(
+                'no_candidate_replans', 0
+            )
+        ),
+        'recharge_only_option_count': high_termination_reason_counts.get(
+            'recharge_only', 0
+        ),
+        'recharge_completed_option_count': (
+            high_termination_reason_counts.get(
+                'recharge_completed', 0
+            )
         ),
         'avg_option_duration': float(np.mean(high_durations)) if high_durations else 0.0,
         'avg_high_option_duration': float(np.mean(high_durations)) if high_durations else 0.0,
@@ -1047,6 +1761,9 @@ def collect_episode(
             episode_high_reward + episode_low_reward
         ) / reward_denominator,
         'charge_success_rate': success_rate,
+        'charge_population_success_rate': (
+            successes / len(env.world.EVs) if env.world.EVs else 0.0
+        ),
         'charge_success_count': successes,
         'charge_success_mcs_count': mcs_successes,
         'charge_success_fcs_count': fcs_successes,
@@ -1063,19 +1780,109 @@ def collect_episode(
                 'low_attributed_mcs_success_weight_sum'
             ]
         ),
+        'rescue_success_count': int(
+            event_audit_totals['rescue_success_count']
+        ),
+        'replacement_success_count': int(
+            event_audit_totals['replacement_success_count']
+        ),
+        'immediate_counterfactual_replacement_count': int(
+            event_audit_totals[
+                'immediate_counterfactual_replacement_count'
+            ]
+        ),
+        'future_rescue_evaluated_success_count': int(
+            event_audit_totals[
+                'future_rescue_evaluated_success_count'
+            ]
+        ),
+        'mcs_success_base_credit_sum': float(
+            event_audit_totals['mcs_success_base_credit_sum']
+        ),
+        'mcs_success_rescue_bonus_sum': float(
+            event_audit_totals['mcs_success_rescue_bonus_sum']
+        ),
+        'mcs_success_credit_sum': float(
+            event_audit_totals['mcs_success_credit_sum']
+        ),
+        'avg_mcs_success_counterfactual_failure_probability': (
+            float(event_audit_totals[
+                'counterfactual_failure_probability_sum'
+            ]) / max(int(event_audit_totals[
+                'attributed_mcs_success_count'
+            ]), 1)
+        ),
         'controllable_failure_count': int(
             event_audit_totals['controllable_failure_count']
+        ),
+        'historically_attributed_failure_count': int(
+            event_audit_totals['historically_attributed_failure_count']
         ),
         'uncontrollable_failure_count': int(
             event_audit_totals['uncontrollable_failure_count']
         ),
+        'unattributed_iev_failure_count': int(
+            event_audit_totals['unattributed_iev_failure_count']
+        ),
         'controllable_failure_weight_sum': float(
             event_audit_totals['controllable_failure_weight_sum']
+        ),
+        'high_controllable_failure_weight_sum': float(
+            event_audit_totals['high_controllable_failure_weight_sum']
         ),
         'low_controllable_failure_weight_sum': float(
             event_audit_totals[
                 'low_controllable_failure_weight_sum'
             ]
+        ),
+        'orphan_controllable_failure_weight_sum': float(
+            event_audit_totals[
+                'orphan_controllable_failure_weight_sum'
+            ]
+        ),
+        'failure_route_weight_coverage': (
+            (
+                float(event_audit_totals[
+                    'high_controllable_failure_weight_sum'
+                ])
+                + float(event_audit_totals[
+                    'low_controllable_failure_weight_sum'
+                ])
+            )
+            / max(float(event_audit_totals[
+                'controllable_failure_weight_sum'
+            ]), 1e-12)
+        ),
+        'high_failure_route_count': int(
+            event_audit_totals['high_failure_route_count']
+        ),
+        'low_failure_route_count': int(
+            event_audit_totals['low_failure_route_count']
+        ),
+        'orphan_failure_route_count': int(
+            event_audit_totals['orphan_failure_route_count']
+        ),
+        'avg_failure_attribution_age_steps': (
+            float(event_audit_totals[
+                'failure_attribution_age_weighted_sum'
+            ]) / max(float(event_audit_totals[
+                'controllable_failure_weight_sum'
+            ]), 1e-12)
+        ),
+        'failure_cause_high_recharge_count': int(
+            event_audit_totals['failure_cause_high_recharge_count']
+        ),
+        'failure_cause_low_wait_count': int(
+            event_audit_totals['failure_cause_low_wait_count']
+        ),
+        'failure_cause_low_reposition_count': int(
+            event_audit_totals['failure_cause_low_reposition_count']
+        ),
+        'high_routed_failure_reward_total': float(
+            event_audit_totals['high_routed_failure_reward_total']
+        ),
+        'low_routed_failure_reward_total': float(
+            event_audit_totals['low_routed_failure_reward_total']
         ),
         'fcs_success_kpi_count': int(
             event_audit_totals['fcs_success_kpi_count']
@@ -1097,6 +1904,7 @@ def collect_episode(
             event_audit_totals['low_passive_wait_count']
         ),
         'low_delayed_event_count': int(low_buffer.delayed_event_count),
+        'high_delayed_event_count': int(high_buffer.delayed_event_count),
         'total_mcs_profit': total_mcs_profit,
         'avg_mcs_profit': total_mcs_profit / mcs_count,
         'total_mcs_cost': total_mcs_cost,
@@ -1180,15 +1988,42 @@ def main() -> None:
     )
     start_episode = 1
     log_rows: List[Dict] = []
-    best_update_reward = -float('inf')
+    best_charge_success_rate = -float('inf')
+    best_mcs_profit_within_success_tolerance = -float('inf')
+    selected_checkpoint_success_rate = -float('inf')
+    selected_checkpoint_mcs_profit = -float('inf')
     if args.resume is not None:
         metadata = agent.load(args.resume, load_optimizers=True)
         start_episode = int(metadata.get('episode', 0)) + 1
-        best_update_reward = float(
-            metadata.get('best_update_reward', best_update_reward)
-        )
         if training_log_path.exists():
             log_rows = pd.read_csv(training_log_path).to_dict('records')
+        if 'best_charge_success_rate' in metadata:
+            best_charge_success_rate = float(
+                metadata['best_charge_success_rate']
+            )
+            best_mcs_profit_within_success_tolerance = float(
+                metadata.get(
+                    'best_mcs_profit_within_success_tolerance',
+                    -float('inf'),
+                )
+            )
+            selected_checkpoint_success_rate = float(metadata.get(
+                'selected_checkpoint_success_rate',
+                best_charge_success_rate,
+            ))
+            selected_checkpoint_mcs_profit = float(metadata.get(
+                'selected_checkpoint_mcs_profit',
+                best_mcs_profit_within_success_tolerance,
+            ))
+        elif log_rows:
+            historical_scores = [
+                float(row.get(
+                    'update_charge_success_rate',
+                    row.get('charge_success_rate', 0.0),
+                ))
+                for row in log_rows
+            ]
+            best_charge_success_rate = max(historical_scores)
     elif args.high_checkpoint is not None:
         source_metadata = agent.load_high_branch(
             args.high_checkpoint,
@@ -1214,8 +2049,13 @@ def main() -> None:
         'torch_version': torch.__version__,
         'torch_cuda_version': torch.version.cuda,
         'low_reward_design_version': (
-            'v8_count_opportunity_urgency_topk'
+            'v10_compacted_explicit_immediate_iev_coverage_priority'
         ),
+        'checkpoint_selection_metric': 'rolling40_success_then_profit',
+        'checkpoint_selection_window': CHECKPOINT_SELECTION_WINDOW,
+        'checkpoint_success_tolerance': CHECKPOINT_SUCCESS_TOLERANCE,
+        'high_option_boundary_version': 'serve_complete_recharge_complete',
+        'low_gae_scope': 'within_high_serve_option',
         'serve_quasi_topk_capacity': max(
             int(TOP_K_MCS_CANDIDATES) - 1, 0
         ),
@@ -1225,12 +2065,64 @@ def main() -> None:
         'low_spatial_opportunity_weight': float(
             LOW_SPATIAL_OPPORTUNITY_WEIGHT
         ),
+        'low_candidate_priority_weight': float(
+            LOW_CANDIDATE_PRIORITY_WEIGHT
+        ),
         'low_serve_move_penalty': float(SERVE_MOVE_PENALTY),
         'low_fcs_alternative_penalty': float(
             LOW_FCS_ALTERNATIVE_PENALTY
         ),
         'low_mcs_alternative_penalty': float(
             LOW_MCS_ALTERNATIVE_PENALTY
+        ),
+        'low_mcs_competition_importance': float(
+            MCS_COMPETITION_IMPORTANCE
+        ),
+        'quasi_attraction_weight': float(QUASI_ATTRACTION_WEIGHT),
+        'iev_attraction_weight': float(IEV_ATTRACTION_WEIGHT),
+        'recharge_option_risk_weight': float(
+            RECHARGE_OPTION_RISK_WEIGHT
+        ),
+        'mcs_success_base_credit': float(MCS_SUCCESS_BASE_CREDIT),
+        'mcs_success_rescue_credit': float(MCS_SUCCESS_RESCUE_CREDIT),
+        'rescue_success_threshold': float(RESCUE_SUCCESS_THRESHOLD),
+        'counterfactual_supply_hazard_scale': float(
+            COUNTERFACTUAL_SUPPLY_HAZARD_SCALE
+        ),
+        'system_failure_event_penalty': float(
+            SYSTEM_FAILURE_EVENT_PENALTY
+        ),
+        'failure_responsibility_decay': float(
+            FAILURE_RESPONSIBILITY_DECAY
+        ),
+        'failure_responsibility_max_age_steps': int(
+            FAILURE_RESPONSIBILITY_MAX_AGE_STEPS
+        ),
+        'mcs_profit_reference': float(MCS_PROFIT_REFERENCE),
+        'high_profit_event_weight': float(HIGH_PROFIT_EVENT_WEIGHT),
+        'low_profit_event_weight': float(LOW_PROFIT_EVENT_WEIGHT),
+        'high_controllable_failure_share': float(
+            HIGH_CONTROLLABLE_FAILURE_SHARE
+        ),
+        'recharge_option_base_cost': float(RECHARGE_OPTION_BASE_COST),
+        'recharge_option_duration_cost': float(
+            RECHARGE_OPTION_DURATION_COST
+        ),
+        'recharge_option_unnecessary_cost': float(
+            RECHARGE_OPTION_UNNECESSARY_COST
+        ),
+        'recharge_option_opportunity_cost': float(
+            RECHARGE_OPTION_OPPORTUNITY_COST
+        ),
+        'recharge_actual_cost_weight': float(
+            RECHARGE_ACTUAL_COST_WEIGHT
+        ),
+        'recharge_cost_reference': float(RECHARGE_COST_REFERENCE),
+        'high_option_termination_rewards': dict(
+            HIGH_OPTION_TERMINATION_REWARDS
+        ),
+        'unattributed_iev_failure_team_penalty': float(
+            UNATTRIBUTED_IEV_FAILURE_TEAM_PENALTY
         ),
     })
     (output_dir / 'training_config.json').write_text(
@@ -1246,7 +2138,9 @@ def main() -> None:
     update_high_buffer = HighOptionRolloutBuffer(
         args.gamma, args.gae_lambda
     )
-    update_low_buffer = LowServeRolloutBuffer(args.low_gamma)
+    update_low_buffer = LowServeRolloutBuffer(
+        args.low_gamma, args.low_gae_lambda
+    )
     pending_episodes: List[tuple[
         int, Dict, HighOptionRolloutBuffer, LowServeRolloutBuffer
     ]] = []
@@ -1296,6 +2190,54 @@ def main() -> None:
         update_avg_reward = float(np.mean([
             row['avg_reward'] for _, row, _, _ in pending_episodes
         ]))
+        current_episode_rows = [
+            row for _, row, _, _ in pending_episodes
+        ]
+        update_charge_success_rate = checkpoint_selection_score(
+            current_episode_rows
+        )
+        update_mcs_profit = checkpoint_selection_profit(
+            current_episode_rows
+        )
+        checkpoint_rows = (log_rows + current_episode_rows)[
+            -CHECKPOINT_SELECTION_WINDOW:
+        ]
+        checkpoint_window_ready = (
+            len(checkpoint_rows) >= CHECKPOINT_SELECTION_WINDOW
+        )
+        checkpoint_charge_success_rate = checkpoint_selection_score(
+            checkpoint_rows
+        )
+        checkpoint_mcs_profit = checkpoint_selection_profit(checkpoint_rows)
+        is_best = False
+        if checkpoint_window_ready:
+            previous_best_success = best_charge_success_rate
+            best_charge_success_rate = max(
+                best_charge_success_rate,
+                checkpoint_charge_success_rate,
+            )
+            if (
+                checkpoint_charge_success_rate
+                > previous_best_success + CHECKPOINT_SUCCESS_TOLERANCE
+            ):
+                best_mcs_profit_within_success_tolerance = -float('inf')
+            success_eligible = (
+                checkpoint_charge_success_rate
+                >= best_charge_success_rate - CHECKPOINT_SUCCESS_TOLERANCE
+            )
+            is_best = bool(
+                success_eligible
+                and checkpoint_mcs_profit
+                > best_mcs_profit_within_success_tolerance
+            )
+            if is_best:
+                best_mcs_profit_within_success_tolerance = (
+                    checkpoint_mcs_profit
+                )
+                selected_checkpoint_success_rate = (
+                    checkpoint_charge_success_rate
+                )
+                selected_checkpoint_mcs_profit = checkpoint_mcs_profit
         update_episode_count = len(pending_episodes)
         update_high_sample_count = len(update_high_buffer)
         update_low_sample_count = len(update_low_buffer)
@@ -1317,6 +2259,24 @@ def main() -> None:
                 'update_high_sample_count': update_high_sample_count,
                 'update_low_sample_count': update_low_sample_count,
                 'update_avg_reward': update_avg_reward,
+                'update_charge_success_rate': update_charge_success_rate,
+                'update_mcs_profit': update_mcs_profit,
+                'checkpoint_selection_metric': (
+                    'rolling40_success_then_profit'
+                ),
+                'checkpoint_selection_score': (
+                    checkpoint_charge_success_rate
+                ),
+                'checkpoint_selection_profit': checkpoint_mcs_profit,
+                'checkpoint_selection_window_size': len(checkpoint_rows),
+                'checkpoint_selection_window_ready': bool(
+                    checkpoint_window_ready
+                ),
+                'best_charge_success_rate': best_charge_success_rate,
+                'best_mcs_profit_within_success_tolerance': (
+                    best_mcs_profit_within_success_tolerance
+                ),
+                'is_best_checkpoint_update': bool(is_best),
                 'training_device': device,
                 'peak_cuda_memory_mb': peak_cuda_memory_mb,
             })
@@ -1337,13 +2297,20 @@ def main() -> None:
         persisted_log = pd.read_csv(training_log_path)
         plot_convergence(persisted_log, curve_path, args.plot_window)
 
-        is_best = update_avg_reward > best_update_reward
-        if is_best:
-            best_update_reward = update_avg_reward
         metadata = {
             'episode': episode,
             'update_index': update_index,
-            'best_update_reward': best_update_reward,
+            'best_charge_success_rate': best_charge_success_rate,
+            'best_mcs_profit_within_success_tolerance': (
+                best_mcs_profit_within_success_tolerance
+            ),
+            'selected_checkpoint_success_rate': (
+                selected_checkpoint_success_rate
+            ),
+            'selected_checkpoint_mcs_profit': selected_checkpoint_mcs_profit,
+            'checkpoint_selection_metric': 'rolling40_success_then_profit',
+            'checkpoint_selection_score': checkpoint_charge_success_rate,
+            'checkpoint_selection_profit': checkpoint_mcs_profit,
             'config': run_config,
         }
         agent.save(latest_model_path, metadata)
@@ -1363,6 +2330,10 @@ def main() -> None:
             f'{pending_episodes[0][0]}-{episode} '
             f'samples={update_sample_count} '
             f'avg_reward={update_avg_reward:.4f} '
+            f'charge_success={update_charge_success_rate:.4f} '
+            f'mcs_profit={update_mcs_profit:.2f} '
+            f'checkpoint40_success={checkpoint_charge_success_rate:.4f} '
+            f'best={is_best} '
             f'actor_loss={loss_metrics["actor_loss"]:.4f} '
             f'critic_loss={loss_metrics["critic_loss"]:.4f} '
             f'cuda_peak_mb={peak_cuda_memory_mb:.1f}'
@@ -1370,14 +2341,22 @@ def main() -> None:
         update_high_buffer = HighOptionRolloutBuffer(
             args.gamma, args.gae_lambda
         )
-        update_low_buffer = LowServeRolloutBuffer(args.low_gamma)
+        update_low_buffer = LowServeRolloutBuffer(
+            args.low_gamma, args.low_gae_lambda
+        )
         pending_episodes.clear()
 
     # Always retain an explicit final numbered checkpoint.
     final_metadata = {
         'episode': final_episode,
         'update_index': update_index,
-        'best_update_reward': best_update_reward,
+        'best_charge_success_rate': best_charge_success_rate,
+        'best_mcs_profit_within_success_tolerance': (
+            best_mcs_profit_within_success_tolerance
+        ),
+        'selected_checkpoint_success_rate': selected_checkpoint_success_rate,
+        'selected_checkpoint_mcs_profit': selected_checkpoint_mcs_profit,
+        'checkpoint_selection_metric': 'rolling40_success_then_profit',
         'config': run_config,
     }
     agent.save(

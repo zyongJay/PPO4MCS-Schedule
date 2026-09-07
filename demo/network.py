@@ -326,8 +326,10 @@ class MCSMAPPOAgent:
         return values.detach().cpu().numpy()
 
     @torch.no_grad()
-    def select_mcs_actions_batch(self, observations: list[Dict]) -> list[Dict]:
-        """Sample High actions and the Serve-only Low subset in two GPU batches."""
+    def select_high_actions_batch(
+        self, observations: list[Dict]
+    ) -> list[Dict]:
+        """仅在 High option 边界批量采样 Serve/Recharge。"""
         if not observations:
             return []
         high_states = self._tensor(np.stack([
@@ -344,41 +346,61 @@ class MCSMAPPOAgent:
 
         action_indices = high_actions.detach().cpu().numpy().astype(int)
         high_log_prob_values = high_log_probs.detach().cpu().numpy()
-        results = [{
+        return [{
             'mode': MCS_ACTION_NAMES[action_index],
             'high_action': int(action_index),
             'high_log_prob': float(high_log_prob_values[index]),
-            'low_action': -1,
-            'low_log_prob': 0.0,
         } for index, action_index in enumerate(action_indices)]
 
-        serve_indices = np.flatnonzero(action_indices == 0)
+    @torch.no_grad()
+    def select_low_actions_batch(
+        self, observations: list[Dict]
+    ) -> list[Dict]:
+        """在已激活的 High Serve option 内批量采样 Low 子决策。"""
+        if not observations:
+            return []
+        low_self_states = self._tensor(np.stack([
+            observation['low_self_state'] for observation in observations
+        ]))
+        low_candidates = self._tensor(np.stack([
+            observation['low_candidates'] for observation in observations
+        ]))
+        low_masks = self._tensor(np.stack([
+            observation['low_candidate_mask'] for observation in observations
+        ]), dtype=torch.bool)
+        low_distribution = self.low_actor.distribution(
+            low_self_states, low_candidates, low_masks
+        )
+        low_actions = low_distribution.sample()
+        low_log_probs = low_distribution.log_prob(low_actions)
+        action_values = low_actions.detach().cpu().numpy().astype(int)
+        log_prob_values = low_log_probs.detach().cpu().numpy()
+        return [{
+            'low_action': int(action_values[index]),
+            'low_log_prob': float(log_prob_values[index]),
+        } for index in range(len(observations))]
+
+    @torch.no_grad()
+    def select_mcs_actions_batch(self, observations: list[Dict]) -> list[Dict]:
+        """兼容旧调用方：同时采样 High 及 Serve 子集的 Low。"""
+        results = self.select_high_actions_batch(observations)
+        if not results:
+            return []
+        for item in results:
+            item['low_action'] = -1
+            item['low_log_prob'] = 0.0
+
+        serve_indices = np.asarray([
+            index for index, item in enumerate(results)
+            if item['high_action'] == 0
+        ], dtype=int)
         if serve_indices.size:
-            low_self_states = self._tensor(np.stack([
-                observations[index]['low_self_state']
-                for index in serve_indices
-            ]))
-            low_candidates = self._tensor(np.stack([
-                observations[index]['low_candidates']
-                for index in serve_indices
-            ]))
-            low_masks = self._tensor(np.stack([
-                observations[index]['low_candidate_mask']
-                for index in serve_indices
-            ]), dtype=torch.bool)
-            low_distribution = self.low_actor.distribution(
-                low_self_states, low_candidates, low_masks
-            )
-            low_actions = low_distribution.sample()
-            low_log_probs = low_distribution.log_prob(low_actions)
-            low_action_values = low_actions.detach().cpu().numpy().astype(int)
-            low_log_prob_values = low_log_probs.detach().cpu().numpy()
+            low_results = self.select_low_actions_batch([
+                observations[index] for index in serve_indices
+            ])
             for batch_index, observation_index in enumerate(serve_indices):
-                results[int(observation_index)]['low_action'] = int(
-                    low_action_values[batch_index]
-                )
-                results[int(observation_index)]['low_log_prob'] = float(
-                    low_log_prob_values[batch_index]
+                results[int(observation_index)].update(
+                    low_results[batch_index]
                 )
         return results
 

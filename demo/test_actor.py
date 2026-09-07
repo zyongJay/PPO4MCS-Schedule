@@ -1,12 +1,15 @@
-"""使用固定场景对比 V5 分层策略、随机 Low 和完整 Random 策略。
+"""使用固定场景对比 v10 分层策略、随机 Low、完整 Random 和阈值 High。
 
-实验 A：V5 High Actor + V5 Low Actor，High/Low 均使用确定性贪心动作。
-实验 B：V5 High Actor + Random Low，High 使用同一个确定性策略，底层仅在
+实验 A：v10 High Actor + v10 Low Actor，High/Low 均使用确定性贪心动作。
+实验 B：v10 High Actor + Random Low，High 使用同一个确定性策略，底层仅在
         Low Actor 当前可见的合法 quasi 候选中均    匀随机选择。
 实验 C：完整采用 test.py 中的 RandomDecisionPolicy，包括补电规则、随机选取
         周围 quasi 和无候选时 Wait 的规则。
+实验 D：保持与 A 完全相同的 Option 生命周期、合法动作域和 v10 Low Actor，
+        仅将 learned High Actor 替换为 40 kWh 固定阈值规则。Serve 因绝对
+        安全约束不可用时仍强制 Recharge；阈值只在 High Option 边界判断。
 
-默认读取 ``training_results_v5/model_episode_300.pt``，并在种子 1001--1050
+默认读取 ``training_results_v10/best_model.pt``，并在种子 1001--1050
 对应的 50 个固定场景上进行配对测试。结果输出到项目根目录的
 ``test_actor_results``。
 """
@@ -27,7 +30,13 @@ import pandas as pd
 import torch
 
 import world as world_module
-from config import MAX_STEPS_PER_EPISODE, TRACK_DATA_PATH
+from config import (
+    MAX_CONSECUTIVE_NO_CANDIDATE_LOW_REPLANS,
+    MAX_SERVE_OPTION_STEPS,
+    MAX_STEPS_PER_EPISODE,
+    MCS_RECHARGE_THRESHOLD,
+    TRACK_DATA_PATH,
+)
 from core import EV, MCS
 from environment import MultiAgentEnv
 from matching import RechargeMatcher
@@ -47,7 +56,7 @@ from test import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
 DEFAULT_CHECKPOINT = (
-    PROJECT_DIR / 'training_results_v5' / 'model_episode_300.pt'
+    PROJECT_DIR / 'training_results_v10' / 'best_model.pt'
 )
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / 'test_actor_results'
 DEFAULT_ACTOR_SEEDS = tuple(range(1001, 1051))
@@ -55,36 +64,69 @@ DEFAULT_ACTOR_SEEDS = tuple(range(1001, 1051))
 # config.py 中的轨迹路径以 demo 目录为基准。转为绝对路径，避免启动目录影响。
 world_module.TRACK_DATA_PATH = str((SCRIPT_DIR / TRACK_DATA_PATH).resolve())
 
-EXPERIMENT_A = 'A_v5_high_v5_low'
-EXPERIMENT_B = 'B_v5_high_random_low'
+EXPERIMENT_A = 'A_v10_high_v10_low'
+EXPERIMENT_B = 'B_v10_high_random_low'
 EXPERIMENT_C = 'C_full_random'
+EXPERIMENT_D = 'D_threshold40_option_high_v10_low'
 
 # Low Actor 候选特征在 observation.py 中的定义。
 LOW_FEATURE_NAMES = (
     'urgency_demand_ratio',
     'distance_ratio',
     'attraction',
+    'immediate_iev_attraction',
     'mcs_competition',
     'fcs_competition',
 )
 
 
+def select_threshold_high_action(mcs: MCS, observation: Dict) -> int:
+    """在 High Option 边界返回阈值基线动作索引。
+
+    D 与 A 共用同一个两动作安全可行域。只有 Serve/Recharge 同时合法时，
+    才由严格的 ``remain < 40 kWh`` 阈值替代 learned High Actor；若 Serve
+    已被绝对安全约束屏蔽，则无条件 Recharge。这样 A-D 的可控差异只有
+    High 决策器，而不是 Option 生命周期、Low Actor 或安全约束。
+    """
+    high_mask = np.asarray(
+        observation.get('high_action_mask', []), dtype=bool
+    ).reshape(-1)
+    if high_mask.size < 2:
+        raise ValueError('阈值 High 缺少 Serve/Recharge 动作掩码')
+
+    serve_allowed = bool(high_mask[0])
+    recharge_allowed = bool(high_mask[1])
+    if not serve_allowed and recharge_allowed:
+        return 1
+    if (
+        serve_allowed
+        and recharge_allowed
+        and float(mcs.remain) < float(MCS_RECHARGE_THRESHOLD)
+    ):
+        return 1
+    if serve_allowed:
+        return 0
+    if recharge_allowed:
+        return 1
+    raise RuntimeError('High 动作掩码中 Serve/Recharge 均不可用')
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='在 50 个固定场景中对比 V5 分层策略与完整 Random 策略'
+        description='在固定场景中对比四组 High/Low/Random 消融策略'
     )
     parser.add_argument(
         '--checkpoint',
         type=Path,
         default=DEFAULT_CHECKPOINT,
-        help='默认使用 V5 的 model_episode_300.pt',
+        help='默认使用 v10 按充电率选出的 best_model.pt',
     )
     parser.add_argument(
         '--seeds',
         type=int,
         nargs='+',
         default=list(DEFAULT_ACTOR_SEEDS),
-        help='三组实验共同使用的固定场景种子',
+        help='四组实验共同使用的固定场景种子',
     )
     parser.add_argument(
         '--max-steps', type=int, default=MAX_STEPS_PER_EPISODE
@@ -104,26 +146,39 @@ def parse_args() -> argparse.Namespace:
         '--output-dir', type=Path, default=DEFAULT_OUTPUT_DIR
     )
     parser.add_argument(
+        '--append',
+        action='store_true',
+        help=(
+            '将新场景追加到 output-dir 中已有的 actor_scenarios.csv，'
+            '并基于合并后的全部场景重算汇总与配对比较'
+        ),
+    )
+    parser.add_argument(
         '--no-save', action='store_true', help='仅打印结果，不保存 CSV/JSON'
     )
     return parser.parse_args()
 
 
-class V5LowAblationPolicy:
-    """固定使用 V5 High Actor，并允许切换 learned/random Low 策略。"""
+class CheckpointLowAblationPolicy:
+    """使用 checkpoint Low Actor，并允许切换 learned/threshold High。"""
 
     def __init__(
         self,
         agent: MCSMAPPOAgent,
         low_mode: str,
         random_seed: int,
+        high_mode: str = 'learned',
     ):
         if low_mode not in ('learned', 'random'):
             raise ValueError(f'不支持的 low_mode: {low_mode}')
+        if high_mode not in ('learned', 'threshold'):
+            raise ValueError(f'不支持的 high_mode: {high_mode}')
         self.agent = agent
         self.low_mode = low_mode
+        self.high_mode = high_mode
         self.rng = random.Random(random_seed)
         self.recharge_matcher = RechargeMatcher()
+        self.active_high_options: Dict[int, Dict] = {}
 
         # 统计 High Actor 的原始请求动作，不把 Recharge 匹配失败后的 Wait
         # 误记为 High Actor 主动选择 Wait。
@@ -137,25 +192,37 @@ class V5LowAblationPolicy:
 
     @torch.no_grad()
     def _select_mcs_actions(
-        self, observations: Sequence[Dict]
+        self,
+        mcss: Sequence[MCS],
+        observations: Sequence[Dict],
+        select_low: bool = True,
     ) -> List[Dict]:
         if not observations:
             return []
+        if len(mcss) != len(observations):
+            raise ValueError('MCS 与 observation 数量不一致')
 
-        # 两组实验的 High Actor 推理过程完全相同，均取合法动作中的最大概率项。
-        high_states = self.agent._tensor(np.stack([
-            obs['high_state'] for obs in observations
-        ]))
-        high_masks = self.agent._tensor(np.stack([
-            obs['high_action_mask'] for obs in observations
-        ]), dtype=torch.bool)
-        high_distribution = self.agent.high_actor.distribution(
-            high_states, high_masks
-        )
-        high_indices = (
-            high_distribution.probs.argmax(dim=-1)
-            .detach().cpu().numpy().astype(int)
-        )
+        if self.high_mode == 'learned':
+            high_states = self.agent._tensor(np.stack([
+                obs['high_state'] for obs in observations
+            ]))
+            high_masks = self.agent._tensor(np.stack([
+                obs['high_action_mask'] for obs in observations
+            ]), dtype=torch.bool)
+            high_distribution = self.agent.high_actor.distribution(
+                high_states, high_masks
+            )
+            high_indices = (
+                high_distribution.probs.argmax(dim=-1)
+                .detach().cpu().numpy().astype(int)
+            )
+        else:
+            # D 只替换 Option 边界处的 High 决策器；Option 生命周期、Low
+            # Actor 和安全可行域与 A 完全一致。
+            high_indices = np.asarray([
+                select_threshold_high_action(mcs, observation)
+                for mcs, observation in zip(mcss, observations)
+            ], dtype=int)
 
         results = []
         for action_index in high_indices:
@@ -164,21 +231,36 @@ class V5LowAblationPolicy:
             results.append({'mode': mode, 'low_action': -1})
 
         serve_indices = np.flatnonzero(high_indices == 0)
-        if not serve_indices.size:
+        if not serve_indices.size or not select_low:
             return results
+        selected_low_indices = self._select_low_actions([
+            observations[int(index)] for index in serve_indices
+        ])
+        for batch_index, observation_index in enumerate(serve_indices):
+            results[int(observation_index)]['low_action'] = int(
+                selected_low_indices[batch_index]
+            )
+        return results
 
+    @torch.no_grad()
+    def _select_low_actions(
+        self,
+        observations: Sequence[Dict],
+    ) -> List[int]:
+        if not observations:
+            return []
         if self.low_mode == 'learned':
             low_self_states = self.agent._tensor(np.stack([
-                observations[index]['low_self_state']
-                for index in serve_indices
+                observation['low_self_state']
+                for observation in observations
             ]))
             low_candidates = self.agent._tensor(np.stack([
-                observations[index]['low_candidates']
-                for index in serve_indices
+                observation['low_candidates']
+                for observation in observations
             ]))
             low_masks = self.agent._tensor(np.stack([
-                observations[index]['low_candidate_mask']
-                for index in serve_indices
+                observation['low_candidate_mask']
+                for observation in observations
             ]), dtype=torch.bool)
             low_distribution = self.agent.low_actor.distribution(
                 low_self_states, low_candidates, low_masks
@@ -191,11 +273,9 @@ class V5LowAblationPolicy:
             # 为保证消融实验只改变“如何选 quasi”，随机策略与 Low Actor
             # 使用完全相同的合法候选集合，而不是扩大到观测范围外的 EV。
             selected_low_indices = []
-            for observation_index in serve_indices:
+            for observation in observations:
                 valid_indices = np.flatnonzero(
-                    observations[int(observation_index)][
-                        'low_candidate_mask'
-                    ]
+                    observation['low_candidate_mask']
                 )
                 if not valid_indices.size:
                     raise RuntimeError(
@@ -208,13 +288,11 @@ class V5LowAblationPolicy:
                 selected_low_indices, dtype=int
             )
 
-        for batch_index, observation_index in enumerate(serve_indices):
-            observation_index = int(observation_index)
+        results: List[int] = []
+        for batch_index, observation in enumerate(observations):
             low_index = int(selected_low_indices[batch_index])
-            observation = observations[observation_index]
             if not bool(observation['low_candidate_mask'][low_index]):
                 raise RuntimeError('底层策略选择了非法 quasi 候选')
-            results[observation_index]['low_action'] = low_index
             self.low_selected_ranks.append(low_index + 1)
             self.low_selected_features.append(
                 np.asarray(
@@ -222,6 +300,7 @@ class V5LowAblationPolicy:
                     dtype=np.float64,
                 ).copy()
             )
+            results.append(low_index)
         return results
 
     def build_actions(
@@ -238,20 +317,74 @@ class V5LowAblationPolicy:
         acting_mcss = [
             actor for actor in acting_agents if isinstance(actor, MCS)
         ]
-        mcs_observations = [
-            observation_by_agent[mcs] for mcs in acting_mcss
-        ]
-        selected_actions = self._select_mcs_actions(mcs_observations)
-        selected_by_id = {
-            mcs.id: (observation, action)
-            for mcs, observation, action in zip(
-                acting_mcss, mcs_observations, selected_actions
+        mcs_by_id = {mcs.id: mcs for mcs in env.world.MCSs}
+        for mcs_id, state in list(self.active_high_options.items()):
+            mcs = mcs_by_id[mcs_id]
+            if state['mode'] == 'Serve' and mcs.is_task:
+                state['task_started'] = True
+            completed = bool(
+                state['mode'] == 'Serve'
+                and state['task_started'] and mcs.is_idle
+            ) or bool(
+                state['mode'] == 'Recharge'
+                and state['matched'] and mcs.is_idle
             )
-        }
+            abnormal = bool(
+                state['mode'] == 'Serve'
+                and (
+                    state['duration_steps'] >= MAX_SERVE_OPTION_STEPS
+                    or state['no_candidate_replans']
+                    >= MAX_CONSECUTIVE_NO_CANDIDATE_LOW_REPLANS
+                )
+            )
+            if completed or abnormal or mcs.is_broken or mcs.is_energy_stranded:
+                self.active_high_options.pop(mcs_id, None)
 
+        for mcs in acting_mcss:
+            state = self.active_high_options.get(mcs.id)
+            if (
+                state is not None and state['mode'] == 'Serve'
+                and bool(
+                    observation_by_agent[mcs].get(
+                        'high_recharge_only', False
+                    )
+                )
+            ):
+                self.active_high_options.pop(mcs.id)
+
+        boundary_mcss = [
+            mcs for mcs in acting_mcss
+            if mcs.id not in self.active_high_options
+        ]
+        boundary_observations = [
+            observation_by_agent[mcs] for mcs in boundary_mcss
+        ]
+        boundary_actions = self._select_mcs_actions(
+            boundary_mcss, boundary_observations, select_low=False
+        )
+        for mcs, action in zip(boundary_mcss, boundary_actions):
+            self.active_high_options[mcs.id] = {
+                'mode': action['mode'],
+                'duration_steps': 0,
+                'no_candidate_replans': 0,
+                'task_started': False,
+                'matched': False,
+            }
+
+        active_serve_mcss = [
+            mcs for mcs in acting_mcss
+            if self.active_high_options[mcs.id]['mode'] == 'Serve'
+        ]
+        low_actions = self._select_low_actions([
+            observation_by_agent[mcs] for mcs in active_serve_mcss
+        ])
+        low_action_by_id = {
+            mcs.id: low_actions[index]
+            for index, mcs in enumerate(active_serve_mcss)
+        }
         recharge_requests = [
-            mcs for mcs, action in zip(acting_mcss, selected_actions)
-            if action['mode'] == 'Recharge'
+            mcs for mcs in acting_mcss
+            if self.active_high_options[mcs.id]['mode'] == 'Recharge'
         ]
         recharge_results = self.recharge_matcher.match_all(
             recharge_requests, env.world.FCSs
@@ -268,7 +401,9 @@ class V5LowAblationPolicy:
                 action_n.append(iev_track_action(actor))
                 continue
 
-            observation, action = selected_by_id[actor.id]
+            observation = observation_by_agent[actor]
+            state = self.active_high_options[actor.id]
+            state['duration_steps'] += 1
             common = {
                 # 显式传回决策时的 mask，使 reward.py 能准确区分 forced Wait
                 # 与 voluntary Wait。
@@ -276,8 +411,9 @@ class V5LowAblationPolicy:
                     observation['high_action_mask'].tolist()
                 ),
             }
-            if action['mode'] == 'Recharge':
+            if state['mode'] == 'Recharge':
                 matched = actor.id in recharge_matched_ids
+                state['matched'] = bool(state['matched'] or matched)
                 action_n.append({
                     **common,
                     'mode': 'Recharge' if matched else 'Wait',
@@ -289,12 +425,17 @@ class V5LowAblationPolicy:
                     ),
                 })
             else:
+                low_action = low_action_by_id[actor.id]
                 candidate_id = int(
-                    observation['candidate_ids'][action['low_action']]
+                    observation['candidate_ids'][low_action]
                 )
                 low_stay_selected = candidate_id == MCS_STAY_CANDIDATE_ID
                 has_quasi_candidate = bool(
                     observation.get('quasi_candidate_count', 0) > 0
+                )
+                state['no_candidate_replans'] = (
+                    0 if has_quasi_candidate
+                    else state['no_candidate_replans'] + 1
                 )
                 target = ev_by_id.get(candidate_id)
                 if (
@@ -415,7 +556,8 @@ class InstrumentedRandomDecisionPolicy(RandomDecisionPolicy):
             'high_wait_ratio': (
                 self.high_action_counts.get('Wait', 0) / total if total else 0.0
             ),
-            # C 组没有 Low Actor 的候选索引和五维候选特征；用 NaN 明确标记
+            # C 组没有 Low Actor 的候选索引和 checkpoint 候选特征；用 NaN
+            # 明确标记
             # “不适用”，防止汇总时被误当作 0。
             'low_selection_count': np.nan,
             'avg_low_selected_candidate_rank': np.nan,
@@ -448,9 +590,20 @@ def evaluate_scenario(
     if policy_mode == 'full_random':
         # 与 test.py 的 build_decision_policy(..., seed=scenario_seed) 一致。
         policy = InstrumentedRandomDecisionPolicy(scenario_seed)
-    elif policy_mode in ('learned', 'random_low'):
+    elif policy_mode in (
+        'learned', 'random_low', 'threshold_high_learned_low'
+    ):
         low_mode = 'learned' if policy_mode == 'learned' else 'random'
-        policy = V5LowAblationPolicy(agent, low_mode, random_low_seed)
+        if policy_mode == 'threshold_high_learned_low':
+            low_mode = 'learned'
+        high_mode = (
+            'threshold'
+            if policy_mode == 'threshold_high_learned_low'
+            else 'learned'
+        )
+        policy = CheckpointLowAblationPolicy(
+            agent, low_mode, random_low_seed, high_mode=high_mode
+        )
     else:
         raise ValueError(f'未知实验策略模式: {policy_mode}')
 
@@ -516,8 +669,15 @@ def evaluate_scenario(
     row = {
         'policy_name': experiment_name,
         'policy_type': policy_mode,
+        'high_mode': (
+            policy.high_mode
+            if isinstance(policy, CheckpointLowAblationPolicy)
+            else 'full_random'
+        ),
         'low_mode': (
-            policy_mode if policy_mode != 'full_random' else 'not_applicable'
+            policy.low_mode
+            if isinstance(policy, CheckpointLowAblationPolicy)
+            else 'not_applicable'
         ),
         'checkpoint_path': (
             str(checkpoint_path) if policy_mode != 'full_random' else ''
@@ -567,6 +727,12 @@ def evaluate_scenario(
             provider_counts['FCS'] / success_denominator
         ),
         'broken_mcs_count': int(sum(mcs.is_broken for mcs in mcss)),
+        'energy_stranded_mcs_count': int(sum(
+            mcs.is_energy_stranded for mcs in mcss
+        )),
+        'unavailable_mcs_count': int(sum(
+            mcs.is_broken or mcs.is_energy_stranded for mcs in mcss
+        )),
     }
     row.update(policy.diagnostic_metrics())
     return row
@@ -590,6 +756,8 @@ METRIC_DIRECTIONS = {
     'successful_ev_fcs_count': 'higher',
     'successful_ev_mcs_share': 'higher',
     'broken_mcs_count': 'lower',
+    'energy_stranded_mcs_count': 'lower',
+    'unavailable_mcs_count': 'lower',
     'high_serve_ratio': 'descriptive',
     'high_recharge_ratio': 'descriptive',
     'high_wait_ratio': 'descriptive',
@@ -597,6 +765,7 @@ METRIC_DIRECTIONS = {
     'avg_low_selected_urgency_demand_ratio': 'descriptive',
     'avg_low_selected_distance_ratio': 'descriptive',
     'avg_low_selected_attraction': 'descriptive',
+    'avg_low_selected_immediate_iev_attraction': 'descriptive',
     'avg_low_selected_mcs_competition': 'descriptive',
     'avg_low_selected_fcs_competition': 'descriptive',
 }
@@ -604,12 +773,15 @@ METRIC_DIRECTIONS = {
 COMPARISON_PAIRS = (
     (EXPERIMENT_A, EXPERIMENT_B),
     (EXPERIMENT_A, EXPERIMENT_C),
+    (EXPERIMENT_A, EXPERIMENT_D),
     (EXPERIMENT_B, EXPERIMENT_C),
+    (EXPERIMENT_B, EXPERIMENT_D),
+    (EXPERIMENT_C, EXPERIMENT_D),
 )
 
 
 def build_paired_comparison(scenarios: pd.DataFrame) -> pd.DataFrame:
-    """对 A/B/C 两两配对，避免场景难度差异掩盖策略差异。"""
+    """对 A/B/C/D 两两配对，避免场景难度差异掩盖策略差异。"""
     rows = []
     pivot_tables = {
         metric: scenarios.pivot(
@@ -690,7 +862,7 @@ def print_comparison(comparison: pd.DataFrame) -> None:
         'high_wait_ratio',
         'avg_low_selected_candidate_rank',
     ]
-    print('\n三组策略两两配对汇总（delta = left - right）')
+    print('\n四组策略两两配对汇总（delta = left - right）')
     for comparison_name, group in comparison.groupby(
         'comparison', sort=False
     ):
@@ -739,8 +911,9 @@ def main() -> None:
         (EXPERIMENT_A, 'learned'),
         (EXPERIMENT_B, 'random_low'),
         (EXPERIMENT_C, 'full_random'),
+        (EXPERIMENT_D, 'threshold_high_learned_low'),
     )
-    # 种子在外层循环，使每个场景的 A/B/C 结果紧邻输出，便于观察配对差异。
+    # 种子在外层循环，使每个场景的 A/B/C/D 结果紧邻输出。
     for seed in args.seeds:
         for experiment_name, policy_mode in experiments:
             random_low_seed = (
@@ -768,18 +941,45 @@ def main() -> None:
             )
 
     scenario_table = pd.DataFrame(scenario_rows)
+    output_dir = args.output_dir.expanduser().resolve()
+    scenario_path = output_dir / 'actor_scenarios.csv'
+    summary_path = output_dir / 'actor_summary.csv'
+    comparison_path = output_dir / 'actor_paired_comparison.csv'
+    config_path = output_dir / 'actor_config.json'
+
+    if args.append:
+        if args.no_save:
+            raise ValueError('--append 不能与 --no-save 同时使用')
+        if not scenario_path.is_file():
+            raise FileNotFoundError(
+                f'--append 要求已有逐场景结果: {scenario_path}'
+            )
+        existing_table = pd.read_csv(scenario_path)
+        if list(existing_table.columns) != list(scenario_table.columns):
+            raise ValueError('已有结果与新增结果的 CSV 列结构不一致')
+        key_columns = ['policy_name', 'scenario_seed']
+        existing_keys = existing_table[key_columns].astype(str).agg(
+            '|'.join, axis=1
+        )
+        new_keys = scenario_table[key_columns].astype(str).agg(
+            '|'.join, axis=1
+        )
+        duplicate_keys = sorted(set(existing_keys) & set(new_keys))
+        if duplicate_keys:
+            raise ValueError(
+                '--append 检测到重复的策略/场景种子: '
+                f'{duplicate_keys[:10]}'
+            )
+        scenario_table = pd.concat(
+            [existing_table, scenario_table], ignore_index=True
+        )
+
     summary_table = build_summary(scenario_table)
     comparison_table = build_paired_comparison(scenario_table)
     print_comparison(comparison_table)
 
     if not args.no_save:
-        output_dir = args.output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        scenario_path = output_dir / 'actor_scenarios.csv'
-        summary_path = output_dir / 'actor_summary.csv'
-        comparison_path = output_dir / 'actor_paired_comparison.csv'
-        config_path = output_dir / 'actor_config.json'
-
         scenario_table.to_csv(scenario_path, index=False)
         summary_table.to_csv(summary_path, index=False)
         comparison_table.to_csv(comparison_path, index=False)
@@ -789,22 +989,47 @@ def main() -> None:
             ),
             'checkpoint': str(checkpoint_path),
             'checkpoint_metadata': checkpoint_metadata,
-            'seeds': list(args.seeds),
-            'paired_scenario_count': len(args.seeds),
+            'seeds': sorted(
+                scenario_table['scenario_seed'].astype(int).unique().tolist()
+            ),
+            'paired_scenario_count': int(
+                scenario_table['scenario_seed'].nunique()
+            ),
             'max_steps': max_steps,
             'hidden_dim': args.hidden_dim,
             'device': device,
             'torch_threads': args.torch_threads,
             'random_low_seed_offset': args.random_low_seed_offset,
             'experiment_a': (
-                'V5 High Actor 贪心 + V5 Low Actor 贪心'
+                'checkpoint High Actor 贪心 + checkpoint Low Actor 贪心'
             ),
             'experiment_b': (
-                'V5 High Actor 贪心 + 在同一合法候选集合中均匀随机选 quasi'
+                'checkpoint High Actor 贪心 + 在同一合法候选集合中均匀随机选 quasi'
             ),
             'experiment_c': (
-                '完整复用 test.py RandomDecisionPolicy；随机种子等于场景种子'
+                '完整复用带 quasi 安全过滤的 test.py RandomDecisionPolicy；'
+                '随机种子等于场景种子'
             ),
+            'experiment_d': (
+                '与A共用Option生命周期、合法动作域和checkpoint Low Actor；'
+                '仅在High Option边界用严格remain<40 kWh阈值替换learned High，'
+                'Serve被绝对安全约束屏蔽时强制Recharge'
+            ),
+            'experiment_a_vs_d_control': (
+                'A-D的预期唯一策略差异是High决策器：'
+                'A=checkpoint High贪心，D=Option边界40 kWh阈值；'
+                '两者Low Actor、checkpoint、候选集合、安全掩码和Option终止规则一致'
+            ),
+            'quasi_safety_constraint': (
+                'A/B/D 使用 observation.low_candidate_mask 中经过 '
+                'MCS->quasi->最近FCS 能量过滤的候选；C 使用 '
+                'RandomDecisionPolicy 的同一物理安全过滤（不应用紧急度Top-K）'
+            ),
+            'policy_name_note': (
+                'A/B/D 的 policy_name 使用 v10 标签；实际模型和 episode '
+                '以 checkpoint 与 checkpoint_metadata 字段为准'
+            ),
+            'low_candidate_feature_names': LOW_FEATURE_NAMES,
             'decision_time_scope': (
                 '根据当前全部 observation 生成完整 action_n；不包含 env.step()'
             ),
@@ -818,7 +1043,7 @@ def main() -> None:
             encoding='utf-8',
         )
         print(f'\n逐场景结果: {scenario_path}')
-        print(f'三组汇总结果: {summary_path}')
+        print(f'四组汇总结果: {summary_path}')
         print(f'两两配对差异结果: {comparison_path}')
         print(f'评估配置: {config_path}')
 

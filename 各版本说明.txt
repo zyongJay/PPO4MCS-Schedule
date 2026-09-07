@@ -1,0 +1,10 @@
+1.training_results: 基于"成功充电"事件分发奖励
+2.training_results_v2：初次加入 竞争/吸引力即时奖励 用于缓解奖励稀疏问题 
+3.training_results_v3：仅用 竞争/吸引力即时奖励，屏蔽基于事件的奖励
+4.training_results_v4：引入"系统级"全局奖励，增/减EV数量 平均分配给每个MCS
+5.training_results_v5：将"充电成功EV数"奖励分配给指导MCS、优化Wait惩罚策略、剔除FCS完成的EV充电产生的奖励
+6.training_results_v6：解耦High/Low Critic
+7.training_results_v7：增加单次补电量与速度
+8.training_results_v8：仿真规则保证 MCS全局匹配FCS MCS严格安全不会broken wait动作转移至Low层 TopK quasi候选按照紧急程度排序 优化Low Reward 奖励远离竞争而不考虑充电量
+9.training_results_v9：修复时间截断时最后一个 Low transition 使用最终状态 V_low 进行 bootstrap；IEV-MCS 即时匹配增加“服务后 MCS 剩余电量严格大于前往最近 FCS 所需电量”的硬约束；High 改为按 Option 边界决策，Serve 以一次 MCS-IEV 匹配完成或超时/连续无候选/仅 Recharge 可行/回合结束为终止，Recharge 以完成补电为终止；一个 Serve Option 内允许多次 Low 重规划，并完善对应 High/Low GAE 传播。
+10.training_results_v10：汇总原v10-v16的全部更新。checkpoint选择先改为充电成功率，最终采用rolling-40成功率，并在0.2个百分点容差内以MCS收益作次级比较。奖励方面删除High Serve逐step可行性奖励，增加High Option异常终止奖励且已匹配Serve超时不惩罚；Recharge风险奖励改为Option起止差分，并加强可选Recharge的基础、时长、不必要补电、服务机会与实际成本惩罚，使无价值目标时等待优于盲目补电；空间塑形提高IEV相对quasi的权重；High/Low均加入真实MCS收益信号；不可归因IEV失败采用小团队惩罚，可归因失败同时进入High/Low，并回看最近12 step的历史可行机会。MCS成功进一步拆分为“替代成功”和“救援成功”，基础信用最终设为0.20，救援奖励按“若当前MCS不接单，该IEV最终失败的概率”增加；反事实模型综合IEV剩余等待/能量时间、FCS行驶时间与能耗、当前队列与未来slot释放、其他MCS到达时间/剩余电量/已有任务及资源竞争，并将有效替代供给的Poisson hazard系数由2.0校准为0.45。每次MCS-IEV成功执行前移除当前MCS资源列并重新运行Hungarian：若IEV仍可被其他MCS/FCS即时匹配，则判为替代成功、反事实失败概率为0且仅领取基础信用；否则排除当前空闲资源，再结合未来FCS slot释放和任务中MCS可用时间估计救援概率。失败历史使用稳定high_option_id/low_decision_id，将奖励延迟回写原transition；Recharge延误主要归High，Serve内等待或错误选位主要归Low，责任按0.92^age衰减；可控失败惩罚经校准后最终设为1.5。Low候选边界先引入候选集内居中的紧急需求优先信号，最终将immediate_iev_attraction从总attraction拆为第6个显式观测特征，使Actor区分潜在quasi需求与已形成的即时IEV需求；优先信用最终为20% quasi紧急度、60%即时IEV吸引力、20%总吸引力，只相对同一合法候选集均值计算且stay不重复计奖。日志新增业务与奖励分项、救援/替代成功、High/Low实际路由权重、孤儿权重、归因年龄、失败原因、routed reward、即时替代/未来救援数量，以及所选/可用平均即时IEV吸引力、差值和回报相关性。开发过程中通过多轮提前终止训练验证并修正了信用尺度、FCS替代倾向和Low需求错位；最终完整训练300 episode，81-120至261-300六个连续40回合窗口均达到既定提升标准。末100回合成功率0.8239、平均失败49.38、MCS成功152.46、FCS成功78.62、MCS收益4330.61；最优模型位于episode176，选中rolling-40成功率0.83175、MCS平均收益431.41，训练历史最高rolling-40成功率约0.8330。Recharge比例约0.06、可选Recharge接近0，业务提升未依赖盲目补电。

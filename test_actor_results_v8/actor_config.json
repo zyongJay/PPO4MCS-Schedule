@@ -1,5 +1,5 @@
 {
-  "evaluated_at": "2026-08-18T13:04:18+08:00",
+  "evaluated_at": "2026-08-19T15:45:16+08:00",
   "checkpoint": "D:\\Exp_MCSs\\PPO\\training_results_v8\\model_episode_300.pt",
   "checkpoint_metadata": {
     "episode": 300,
@@ -76,9 +76,12 @@
   "device": "cuda",
   "torch_threads": 1,
   "random_low_seed_offset": 100000,
-  "experiment_a": "V5 High Actor 贪心 + V5 Low Actor 贪心",
-  "experiment_b": "V5 High Actor 贪心 + 在同一合法候选集合中均匀随机选 quasi",
-  "experiment_c": "完整复用 test.py RandomDecisionPolicy；随机种子等于场景种子",
+  "experiment_a": "checkpoint High Actor 贪心 + checkpoint Low Actor 贪心",
+  "experiment_b": "checkpoint High Actor 贪心 + 在同一合法候选集合中均匀随机选 quasi",
+  "experiment_c": "完整复用带 quasi 安全过滤的 test.py RandomDecisionPolicy；随机种子等于场景种子",
+  "experiment_d": "High 使用 40 kWh 固定补电阈值；Low 使用 checkpoint Actor 贪心",
+  "quasi_safety_constraint": "A/B/D 使用 observation.low_candidate_mask 中经过 MCS->quasi->最近FCS 能量过滤的候选；C 使用 RandomDecisionPolicy 的同一物理安全过滤（不应用紧急度Top-K）",
+  "policy_name_note": "A/B 的 policy_name 保留历史 v5 字样以兼容既有 CSV；实际模型以 checkpoint 字段为准",
   "decision_time_scope": "根据当前全部 observation 生成完整 action_n；不包含 env.step()",
   "ev_success_ratio_definition": "success / (success + failure)",
   "paired_delta_definition": "left_policy - right_policy"

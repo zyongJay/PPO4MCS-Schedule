@@ -51,12 +51,23 @@ EV_LOWEST_POWER = 1.0  # 最低电量，低于此值判定充电失败
 MCS_BATTERY_CAPACITY = 300.0  # kwh
 MCS_RECHARGE_THRESHOLD = 40  # MCS低于此值必须补电
 
+# High Serve option 只能在“服务后仍能严格到达最近物理
+# FCS”的绝对安全域内运行。该储备量与单次 MCS-IEV 服务上限
+# 一致；当剩余电量不足以同时覆盖储备量和最近 FCS 行驶能耗时，
+# High mask 只保留 Recharge。
+MCS_SERVE_SAFETY_RESERVE_KWH = MCS_RECHARGE_THRESHOLD
+
 # ============================
 # 5. 时间参数
 # ============================
 STEP_DURATION_MIN = 5
 MAX_WAIT_TIME_STEPS = 4  # IEV最大等待步数
 MAX_STEPS_PER_EPISODE = 200
+
+# High option 边界。Serve 正常以完成一次 MCS-IEV 服务为终止；
+# 以下两项限制长时间无服务的异常 Serve option。
+MAX_SERVE_OPTION_STEPS = 12
+MAX_CONSECUTIVE_NO_CANDIDATE_LOW_REPLANS = 3
 
 # ============================
 # 6. 充电参数
@@ -91,7 +102,7 @@ REWARD_SCALE = 0.01
 W_CHARGE = 3.0
 W_MOVE = 1.0
 
-MCS_FEAT_DIM_tgt = 5
+MCS_FEAT_DIM_tgt = 6
 MCS_FEAT_DIM_self = 3
 MCS_HIGH_FEAT_DIM = 7
 MCS_GLOBAL_STATE_DIM = 20

@@ -1,0 +1,72 @@
+{
+  "status": "entropy_annealing_experiment_completed",
+  "initial_stop_episode": 240,
+  "resume_checkpoint": "model_episode_240.pt",
+  "completed_episode_count": 380,
+  "final_checkpoint": "model_episode_380.pt",
+  "comparison_baseline": "training_results_v8/model_episode_300.pt",
+  "configuration": {
+    "low_smdp_gae": true,
+    "low_gae_lambda": 0.95,
+    "low_entropy_coef_schedule": {
+      "episodes_1_300": 0.01,
+      "episodes_301_340": 0.003,
+      "episodes_341_380": 0.001
+    },
+    "mcs_competition_importance": 1.0,
+    "model_structure_changed": false
+  },
+  "final_window_comparison": {
+    "last_20": {
+      "v9_low_entropy": 0.586965,
+      "v8_low_entropy": 0.321150,
+      "v9_charge_success_rate": 0.813400,
+      "v8_charge_success_rate": 0.817749
+    },
+    "last_40": {
+      "v9_low_entropy": 0.594728,
+      "v8_low_entropy": 0.324842,
+      "v9_charge_success_rate": 0.816048,
+      "v8_charge_success_rate": 0.820073
+    },
+    "last_60": {
+      "v9_low_entropy": 0.614183,
+      "v8_low_entropy": 0.332682,
+      "v9_charge_success_rate": 0.820819,
+      "v8_charge_success_rate": 0.823036
+    },
+    "last_80_at_episode_300": {
+      "v9_low_entropy": 0.621471,
+      "v8_low_entropy": 0.341765,
+      "v9_charge_success_rate": 0.819761,
+      "v8_charge_success_rate": 0.820884
+    }
+  },
+  "entropy_annealing_training_windows": {
+    "episodes_221_300": {
+      "low_entropy": 0.621471,
+      "charge_success_rate": 0.819761
+    },
+    "episodes_301_340_coef_0_003": {
+      "low_entropy": 0.559902,
+      "charge_success_rate": 0.829553
+    },
+    "episodes_341_380_coef_0_001": {
+      "low_entropy": 0.546872,
+      "charge_success_rate": 0.837134,
+      "low_normalized_entropy": 0.387895,
+      "low_top1_probability": 0.778153,
+      "low_top1_top2_probability_gap": 0.629800,
+      "low_sample_greedy_consistency": 0.780240,
+      "low_approx_kl": 0.001635,
+      "low_clip_fraction": 0.017532,
+      "low_actor_grad_norm": 0.140359
+    }
+  },
+  "fixed_scenarios_1001_1020": {
+    "v8_episode_300_charge_success_rate": 0.8272056763446871,
+    "v9_episode_300_charge_success_rate": 0.8290450639227739,
+    "v9_episode_340_charge_success_rate": 0.8265594448351159,
+    "v9_episode_380_charge_success_rate": 0.8285305502654652
+  }
+}

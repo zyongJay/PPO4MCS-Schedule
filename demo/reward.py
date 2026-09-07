@@ -3,15 +3,16 @@ MCS 奖励计算器。
 
 当前奖励分为两个互相独立的层级：
 
-1. step 级奖励：评价本次动作带来的即时状态改善。
-   - High Serve：只评价是否存在合法 Serve 候选，不读取具体吸引力/竞争力。
-   - High Recharge：只评价低电量风险是否下降。
+1. step 级奖励：评价 Low 动作带来的即时空间改善。
+   - High Serve 不再领取逐 step 可行性奖励。
+   - High Recharge 的风险改善在 Option 边界按起止状态一次结算。
    - Low 当前位置固定候选承载主动/被动等待语义，High 不再拥有 Wait。
    - Low Serve：独立评价选位后的需求覆盖、竞争情况和移动能耗。
 2. event 级奖励：评价离散业务事件。
    - MCS 成功事件只奖励实际服务该 EV 的责任 MCS。
-   - 可控失败事件仅进入 Low 的空间责任回报，不进入 High 回报。
-   - FCS 成功和无可行 MCS 的外生失败只记录 KPI，不进入 MCS 回报。
+   - 可控失败事件进入 Low 的空间责任回报。
+   - 无法归因到具体 MCS 的 IEV 失败向 High options 均分一个小团队惩罚。
+   - FCS 成功只记录 KPI，不进入 MCS 回报。
    - MCS 与 IEV 的服务匹配奖励只保留计算和日志，不进入实际回报。
    - MCS 首次 broken、首次 energy-stranded 时给出 High 独占惩罚。
 
@@ -65,13 +66,16 @@ POSITION_DELTA_REFERENCE = 0.25
 # 选位塑形只使用一个综合的“计数型边际服务机会改善”，避免 attraction、
 # MCS competition、FCS competition 在综合 desirability 内外重复计奖。
 LOW_SPATIAL_OPPORTUNITY_WEIGHT = 0.20
+# 当前版在每次 Low 决策边界使用“相对候选集均值”的紧急需求优先信号。
+# 它不奖励区域的绝对需求规模，只奖励同一可行动作集内更能覆盖紧急
+# quasi/IEV 的选择，避免策略仅通过远离竞争资源获得较高 desirability。
+LOW_CANDIDATE_PRIORITY_WEIGHT = 0.20
+LOW_CANDIDATE_URGENCY_SHARE = 0.20
+LOW_CANDIDATE_IMMEDIATE_IEV_SHARE = 0.60
+LOW_CANDIDATE_ATTRACTION_SHARE = 0.20
 # 兼容旧参数名；实际含义已变为综合机会改善权重。
 POSITION_SHAPING_WEIGHT = LOW_SPATIAL_OPPORTUNITY_WEIGHT
 SERVE_MOVE_PENALTY = 0.08
-# High 只判断“当前是否存在合法 Serve 候选”。具体候选的吸引力、竞争力
-# 和位置质量全部交给 Low Actor，避免两层重复优化空间目标。
-HIGH_SERVE_FEASIBILITY_REWARD = 0.02
-
 # Low 成功事件比 High 更严格地衡量系统边际贡献。High 仍沿用原来的
 # FCS 可替代 slot 权重；Low 额外考虑其他可行 MCS，避免通过选位抢占
 # 已有资源能够完成的订单。
@@ -85,13 +89,56 @@ LOW_MCS_ALTERNATIVE_PENALTY = 1.0
 SERVICE_SUCCESS_WEIGHT = 0.60
 SERVICE_ENERGY_WEIGHT = 0.40
 
-# 责任事件的系统总量。成功奖励只给实际服务 MCS；可控失败惩罚按责任
-# 权重归一化分配。每个事件在全部 MCS 上的权重和不超过 1。
+# 当前版将 MCS 成功显式区分为“替代成功”和“救援成功”。基础信用只保证
+# 普通业务有最小正反馈，主要增量来自“若当前 MCS 不接，IEV 最终失败”
+# 的反事实概率。
 SYSTEM_SUCCESS_EVENT_REWARD = 1.0
-SYSTEM_FAILURE_EVENT_PENALTY = 1.1
+SYSTEM_FAILURE_EVENT_PENALTY = 1.5
+MCS_SUCCESS_BASE_CREDIT = 0.20
+MCS_SUCCESS_RESCUE_CREDIT = 1.0 - MCS_SUCCESS_BASE_CREDIT
+RESCUE_SUCCESS_THRESHOLD = 0.50
+# 历史责任越旧，动作与最终失败之间的因果置信度越低。
+FAILURE_RESPONSIBILITY_DECAY = 0.92
+FAILURE_RESPONSIBILITY_MAX_AGE_STEPS = 12
 
-# Recharge 只奖励真实发生的电量风险改善，不再对匹配成功/失败重复计奖。
-RECHARGE_STEP_WEIGHT = 0.20
+# MCS 收益在匹配时一次确认。High 负责 Serve/Recharge 资源配置，Low
+# 负责目标选择，因此两层都接收尺度较小的真实收益信号。
+MCS_PROFIT_REFERENCE = 40.0
+HIGH_PROFIT_EVENT_WEIGHT = 0.25
+LOW_PROFIT_EVENT_WEIGHT = 0.15
+
+# 可控失败不仅属于 Low 选位，也与 High 是否把资源投入 Recharge 有关。
+HIGH_CONTROLLABLE_FAILURE_SHARE = 1.0
+
+# Recharge 只奖励 Option 起止状态之间真实发生的风险改善。该系数保留
+# 旧尺度；最终写入 High rollout 的奖励还会乘 HIGH_STEP_REWARD_WEIGHT。
+RECHARGE_OPTION_RISK_WEIGHT = 0.20
+# 非安全强制 Recharge 的五类成本。forced Recharge 仍只领取风险改善，
+# 不因物理安全约束受罚；Serve 合法时主动 Recharge 才承担这些成本。
+RECHARGE_OPTION_BASE_COST = 0.08
+RECHARGE_OPTION_DURATION_COST = 0.012
+RECHARGE_OPTION_UNNECESSARY_COST = 0.12
+RECHARGE_OPTION_OPPORTUNITY_COST = 0.18
+RECHARGE_ACTUAL_COST_WEIGHT = 0.20
+RECHARGE_COST_REFERENCE = 100.0
+# 兼容旧分析脚本；逐 step Recharge 奖励已经关闭。
+RECHARGE_STEP_WEIGHT = 0.0
+
+# High Option 异常边界奖励均为已经过层级尺度校准的最终奖励，不再额外
+# 乘 HIGH_EVENT_REWARD_WEIGHT。已经匹配到任务的 Serve 超时不处罚。
+HIGH_OPTION_TERMINATION_REWARDS = {
+    # 无候选时 Low stay 是有意保留的安全等待动作，固定成本必须显著低于
+    # 可选 Recharge；否则策略会通过盲目补电逃避 no_candidate 标签。
+    'no_candidate_replans': -0.02,
+    'serve_timeout_before_match': -0.08,
+    'recharge_only': -0.15,
+}
+SERVE_TIMEOUT_DURATION_COST = 0.005
+SERVE_TIMEOUT_OPPORTUNITY_COST = 0.12
+
+# 无法归因给具体 MCS 的单个 IEV 失败，在全部 MCS 上均分该系统总惩罚；
+# 进入 high_event 后仍按 HIGH_EVENT_REWARD_WEIGHT 缩放。
+UNATTRIBUTED_IEV_FAILURE_TEAM_PENALTY = 0.10
 
 # 等待惩罚属于 Low 的固定当前位置动作；High Actor 已不再拥有 Wait。
 # 被动等待没有替代 quasi，因此不处罚；主动等待按基础、机会和连续时长
@@ -170,6 +217,157 @@ class RewardBuilder:
             0.0,
             1.0,
         ))
+
+    @classmethod
+    def compute_recharge_option_reward(
+        cls,
+        start_remain_kwh: float,
+        end_remain_kwh: float,
+        *,
+        duration_steps: int = 1,
+        forced_recharge: bool = False,
+        start_serve_potential: float = 0.0,
+    ) -> Dict[str, float]:
+        """在 Recharge Option 边界结算风险改善及可选补电机会成本。"""
+        start_risk = cls._battery_risk(start_remain_kwh)
+        end_risk = cls._battery_risk(end_remain_kwh)
+        risk_delta = max(start_risk - end_risk, 0.0)
+        risk_reward = (
+            HIGH_STEP_REWARD_WEIGHT
+            * RECHARGE_OPTION_RISK_WEIGHT
+            * risk_delta
+        )
+        base_cost = 0.0
+        duration_cost = 0.0
+        unnecessary_cost = 0.0
+        opportunity_cost = 0.0
+        if not forced_recharge:
+            base_cost = -RECHARGE_OPTION_BASE_COST
+            duration_cost = (
+                -RECHARGE_OPTION_DURATION_COST
+                * max(int(duration_steps), 1)
+            )
+            unnecessary_cost = (
+                -RECHARGE_OPTION_UNNECESSARY_COST * (1.0 - start_risk)
+            )
+            opportunity_cost = (
+                -RECHARGE_OPTION_OPPORTUNITY_COST
+                * float(np.clip(start_serve_potential, 0.0, 1.0))
+            )
+        reward = (
+            risk_reward + base_cost + duration_cost
+            + unnecessary_cost + opportunity_cost
+        )
+        return {
+            'start_risk': float(start_risk),
+            'end_risk': float(end_risk),
+            'risk_delta': float(risk_delta),
+            'risk_reward': float(risk_reward),
+            'base_cost': float(base_cost),
+            'duration_cost': float(duration_cost),
+            'unnecessary_cost': float(unnecessary_cost),
+            'opportunity_cost': float(opportunity_cost),
+            'reward': float(reward),
+        }
+
+    @staticmethod
+    def compute_high_option_termination_reward(
+        reason: str,
+        *,
+        duration_steps: int = 1,
+        start_serve_potential: float = 0.0,
+    ) -> float:
+        """返回结果导向的 High Option 异常终止边界奖励。"""
+        reason = str(reason)
+        reward = float(HIGH_OPTION_TERMINATION_REWARDS.get(reason, 0.0))
+        if reason == 'serve_timeout_before_match':
+            reward -= (
+                SERVE_TIMEOUT_DURATION_COST * max(int(duration_steps), 1)
+                + SERVE_TIMEOUT_OPPORTUNITY_COST
+                * float(np.clip(start_serve_potential, 0.0, 1.0))
+            )
+        return float(reward)
+
+    @staticmethod
+    def compute_low_candidate_priority_reward(
+        selected_urgency: float,
+        selected_attraction: float,
+        available_avg_urgency: float,
+        available_avg_attraction: float,
+        *,
+        selected_immediate_iev_attraction: float = 0.0,
+        available_avg_immediate_iev_attraction: float = 0.0,
+        stay_selected: bool = False,
+    ) -> float:
+        """返回一次 Low 候选选择的居中紧急需求奖励。
+
+        只比较同一决策时刻可见 quasi 的均值，因此不会把不同 episode 的
+        外生需求密度当作策略功劳。原地 stay 继续由 wait 奖励评价，避免
+        用不存在的 quasi 紧急度制造重复惩罚。
+        """
+        if stay_selected:
+            return 0.0
+        selected_priority = (
+            LOW_CANDIDATE_URGENCY_SHARE
+            * float(np.clip(selected_urgency, 0.0, 1.0))
+            + LOW_CANDIDATE_IMMEDIATE_IEV_SHARE
+            * float(np.clip(
+                selected_immediate_iev_attraction, 0.0, 1.0
+            ))
+            + LOW_CANDIDATE_ATTRACTION_SHARE
+            * float(np.clip(selected_attraction, 0.0, 1.0))
+        )
+        average_priority = (
+            LOW_CANDIDATE_URGENCY_SHARE
+            * float(np.clip(available_avg_urgency, 0.0, 1.0))
+            + LOW_CANDIDATE_IMMEDIATE_IEV_SHARE
+            * float(np.clip(
+                available_avg_immediate_iev_attraction, 0.0, 1.0
+            ))
+            + LOW_CANDIDATE_ATTRACTION_SHARE
+            * float(np.clip(available_avg_attraction, 0.0, 1.0))
+        )
+        return float(
+            LOW_CANDIDATE_PRIORITY_WEIGHT
+            * np.clip(selected_priority - average_priority, -1.0, 1.0)
+        )
+
+    @staticmethod
+    def compute_success_credit(responsibility_weight: float) -> float:
+        """基础业务信用与反事实救援信用的有界组合。"""
+        rescue_weight = float(np.clip(responsibility_weight, 0.0, 1.0))
+        return float(
+            MCS_SUCCESS_BASE_CREDIT
+            + MCS_SUCCESS_RESCUE_CREDIT * rescue_weight
+        )
+
+    @staticmethod
+    def compute_high_success_reward(responsibility_weight: float) -> float:
+        """返回可按 serve_option_id 路由的 High 成功事件奖励。"""
+        weight = RewardBuilder.compute_success_credit(responsibility_weight)
+        return float(
+            HIGH_EVENT_REWARD_WEIGHT
+            * SYSTEM_SUCCESS_EVENT_REWARD
+            * weight
+        )
+
+    @staticmethod
+    def compute_high_failure_reward(responsibility_weight: float) -> float:
+        """返回按原始 High option_id 路由的失败事件奖励。"""
+        return float(
+            -HIGH_EVENT_REWARD_WEIGHT
+            * SYSTEM_FAILURE_EVENT_PENALTY
+            * max(float(responsibility_weight), 0.0)
+        )
+
+    @staticmethod
+    def compute_low_failure_reward(responsibility_weight: float) -> float:
+        """返回按原始 Low decision_id 路由的失败事件奖励。"""
+        return float(
+            -LOW_EVENT_REWARD_WEIGHT
+            * SYSTEM_FAILURE_EVENT_PENALTY
+            * max(float(responsibility_weight), 0.0)
+        )
 
     def _quasi_demand(self, quasi: EV) -> Dict[str, float]:
         """计算一个 quasi 节点的潜在需求和附近 IEV 的即时需求。
@@ -578,7 +776,6 @@ class RewardBuilder:
 
         requested_mode = str(event.get('requested_mode', ''))
         is_serve = requested_mode == 'Serve'
-        is_recharge = requested_mode in ('Recharge', 'RechargeProgress')
         is_wait = requested_mode == 'Wait'
         low_stay_selected = bool(event.get('low_stay_selected', False))
         low_forced_stay = bool(event.get('low_forced_stay', False))
@@ -654,6 +851,11 @@ class RewardBuilder:
             movement_cost = -SERVE_MOVE_PENALTY * movement_ratio
 
         resource_gap_improvement = float(position_gain)
+        candidate_priority_reward = float(np.clip(
+            event.get('low_candidate_priority_reward', 0.0),
+            -LOW_CANDIDATE_PRIORITY_WEIGHT,
+            LOW_CANDIDATE_PRIORITY_WEIGHT,
+        ))
         # 旧三项保留为零值兼容字段。吸引力与两类竞争已在 desirability
         # 中组合，再单独加减会重复计奖并放大局部塑形。
         attraction_reward = 0.0
@@ -701,23 +903,11 @@ class RewardBuilder:
         # -----------------------------------------------------------------
         # Recharge：High Actor 只保留实际风险改善 step 奖励
         # -----------------------------------------------------------------
-        previous_remain = float(
-            event.get('previous_remain_kwh', mcs.remain)
-        )
-        current_remain = float(
-            event.get('current_remain_kwh', mcs.remain)
-        )
-        previous_risk = self._battery_risk(previous_remain)
-        current_risk = self._battery_risk(current_remain)
-
+        # Recharge 风险改善在 High Option 边界一次结算；这里显式保持为
+        # 0，防止长 Recharge Option 因逐 step 累加而获得额外收益。
         recharge_step = 0.0
         recharge_match = 0.0
         recharge_match_failure = 0.0
-        if is_recharge:
-            recharge_step = (
-                RECHARGE_STEP_WEIGHT
-                * max(previous_risk - current_risk, 0.0)
-            )
         # 以下变量仅保留旧日志兼容；不再进入任何 High 奖励。
         recharge_event = 0.0
 
@@ -739,7 +929,6 @@ class RewardBuilder:
             event.get('best_available_serve_potential', 0.0), 0.0, 1.0
         ))
         serve_available = bool(event.get('serve_available', False))
-        has_quasi_candidate = bool(event.get('has_quasi_candidate', False))
         voluntary_wait_streak = max(
             int(event.get('consecutive_voluntary_wait_steps', 0)), 0
         )
@@ -807,10 +996,20 @@ class RewardBuilder:
         fcs_success_kpi_count = max(
             int(event.get('fcs_success_kpi_count', 0)), 0
         )
+        unattributed_iev_failure_count = max(
+            int(event.get('unattributed_iev_failure_count', 0)), 0
+        )
+        mcs_team_size = max(int(event.get('mcs_team_size', 1)), 1)
 
+        attributed_success_credit = self.compute_success_credit(
+            attributed_success_weight
+        ) if attributed_success_count > 0 else 0.0
+        low_attributed_success_credit = self.compute_success_credit(
+            low_attributed_success_weight
+        ) if low_attributed_success_weight > 0.0 else 0.0
         attributed_mcs_success = (
             SYSTEM_SUCCESS_EVENT_REWARD
-            * attributed_success_weight
+            * attributed_success_credit
         )
         controllable_failure = (
             -SYSTEM_FAILURE_EVENT_PENALTY
@@ -819,11 +1018,16 @@ class RewardBuilder:
         # 两个 KPI 分量明确保留为 0，防止误接入 High/Low 任一回报。
         uncontrollable_failure = 0.0
         fcs_success_kpi = 0.0
+        unattributed_failure_team_penalty = (
+            -UNATTRIBUTED_IEV_FAILURE_TEAM_PENALTY
+            * unattributed_iev_failure_count
+            / float(mcs_team_size)
+        )
         attributable_system_event = float(
             attributed_mcs_success + controllable_failure
         )
         low_attributed_mcs_success = (
-            SYSTEM_SUCCESS_EVENT_REWARD * low_attributed_success_weight
+            SYSTEM_SUCCESS_EVENT_REWARD * low_attributed_success_credit
         )
         low_controllable_failure = (
             -SYSTEM_FAILURE_EVENT_PENALTY
@@ -843,19 +1047,42 @@ class RewardBuilder:
             else 0.0
         )
 
-        # High 只评价模式选择，不接收具体候选的空间塑形和移动成本。
-        high_serve_suitability = (
-            HIGH_SERVE_FEASIBILITY_REWARD
-            if is_serve and has_quasi_candidate else 0.0
+        profit_delta = max(float(event.get('profit_delta', 0.0)), 0.0)
+        normalized_profit = float(np.clip(
+            profit_delta / max(MCS_PROFIT_REFERENCE, EPSILON), 0.0, 1.0
+        ))
+        high_profit_event = HIGH_PROFIT_EVENT_WEIGHT * normalized_profit
+        low_profit_event = (
+            LOW_PROFIT_EVENT_WEIGHT * normalized_profit
+            if int(event.get('low_decision_id', -1)) >= 0 else 0.0
         )
-        high_step = float(
-            high_serve_suitability + recharge_step
+        recharge_cost_delta = (
+            max(float(event.get('cost_delta', 0.0)), 0.0)
+            if str(event.get('requested_mode', '')).startswith('Recharge')
+            else 0.0
         )
-        # High event 只保留其职责直接对应的三类结果：实际 MCS 成功、
-        # broken 和 energy-stranded。EV 可控失败继续保留给 Low 的
-        # 空间责任链，但不再进入 High 回报。
+        recharge_actual_cost_penalty = (
+            -RECHARGE_ACTUAL_COST_WEIGHT
+            * float(np.clip(
+                recharge_cost_delta / max(RECHARGE_COST_REFERENCE, EPSILON),
+                0.0,
+                1.0,
+            ))
+        )
+
+        # High 不接收具体候选的空间塑形、移动成本或 Serve 可行性奖励。
+        high_serve_suitability = 0.0
+        high_step = 0.0
+        # High event 包含实际 MCS 成功、安全事件，以及无法具体归因时
+        # 的小团队失败惩罚。可归因失败继续保留给 Low 的空间责任链。
         high_event = float(
-            attributed_mcs_success + broken_event + energy_stranded_event
+            attributed_mcs_success
+            + HIGH_CONTROLLABLE_FAILURE_SHARE * controllable_failure
+            + unattributed_failure_team_penalty
+            + high_profit_event
+            + recharge_actual_cost_penalty
+            + broken_event
+            + energy_stranded_event
         )
         # Low step 只属于当前 Serve 决策；TaskProgress 可携带延迟事件，
         # 但不能再次产生选位塑形。
@@ -864,16 +1091,29 @@ class RewardBuilder:
             # 正 step 奖励。被动等待的 wait_step 为 0，主动等待为负。
             low_step = float(wait_step)
         else:
-            low_step = float(serve_step if is_serve else 0.0)
+            low_step = float(
+                serve_step + candidate_priority_reward
+                if is_serve else 0.0
+            )
         has_low_responsibility = int(event.get('low_decision_id', -1)) >= 0
         low_event = float(
-            low_attributed_mcs_success + low_controllable_failure
+            low_attributed_mcs_success
+            + low_controllable_failure
+            + low_profit_event
             if has_low_responsibility else 0.0
         )
 
         high_total = float(
             HIGH_STEP_REWARD_WEIGHT * high_step
             + HIGH_EVENT_REWARD_WEIGHT * high_event
+        )
+        high_attributed_success_weighted = float(
+            HIGH_EVENT_REWARD_WEIGHT * attributed_mcs_success
+        )
+        # 训练时成功事件按原始 Serve option_id 单独路由；团队失败与安全
+        # 事件仍属于当前 High option，防止延迟成功污染后续 Recharge。
+        high_current_option_total = float(
+            high_total - high_attributed_success_weighted
         )
         low_total = float(
             LOW_STEP_REWARD_WEIGHT * low_step
@@ -907,6 +1147,10 @@ class RewardBuilder:
             'low_step': float(low_step),
             'low_event': float(low_event),
             'high_total': high_total,
+            'high_attributed_success_weighted': (
+                high_attributed_success_weighted
+            ),
+            'high_current_option_total': high_current_option_total,
             'low_total': low_total,
             'low_step_weighted': float(
                 LOW_STEP_REWARD_WEIGHT * low_step
@@ -918,20 +1162,47 @@ class RewardBuilder:
             'event_total': event_total,
             # 可审计的原子分量。
             'position_gain': float(position_gain),
+            'low_candidate_priority_reward': float(
+                candidate_priority_reward
+            ),
             'low_attraction_reward': float(attraction_reward),
             'low_immediate_iev_attraction': float(post_immediate_demand),
             'service_success': float(service_success),
             'service_energy': float(service_energy),
             'recharge_match': float(recharge_match),
             'attributed_mcs_success': float(attributed_mcs_success),
+            'attributed_mcs_success_credit': float(
+                attributed_success_credit
+            ),
             'low_attributed_mcs_success': float(
                 low_attributed_mcs_success
+            ),
+            'low_attributed_mcs_success_credit': float(
+                low_attributed_success_credit
             ),
             'controllable_failure': float(controllable_failure),
             'low_controllable_failure': float(
                 low_controllable_failure
             ),
             'uncontrollable_failure': float(uncontrollable_failure),
+            'unattributed_iev_failure_count': float(
+                unattributed_iev_failure_count
+            ),
+            'unattributed_failure_team_penalty': float(
+                unattributed_failure_team_penalty
+            ),
+            'unattributed_failure_team_penalty_weighted': float(
+                HIGH_EVENT_REWARD_WEIGHT
+                * unattributed_failure_team_penalty
+            ),
+            'profit_delta': float(profit_delta),
+            'normalized_profit': float(normalized_profit),
+            'high_profit_event': float(high_profit_event),
+            'low_profit_event': float(low_profit_event),
+            'recharge_cost_delta': float(recharge_cost_delta),
+            'recharge_actual_cost_penalty': float(
+                recharge_actual_cost_penalty
+            ),
             'fcs_success_kpi': float(fcs_success_kpi),
             'attributed_mcs_success_weight': float(
                 attributed_success_weight

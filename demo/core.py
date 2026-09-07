@@ -128,6 +128,11 @@ class EV:
         # 匹配阶段基于同一物理约束矩阵计算的 FCS 可替代性代理。
         self.service_marginal_weight = 0.0
         self.low_service_marginal_weight = 0.0
+        # 若本次 MCS 不接单，IEV 最终失败的反事实概率。成功奖励
+        # 由较小基础信用与该救援概率共同决定。
+        self.service_counterfactual_failure_probability = 0.0
+        self.service_success_credit = 0.0
+        self.service_rescue_diagnostics = {}
         self.feasible_mcs_count = 0
         self.feasible_fcs_slot_count = 0
         self.charge_power_kwh = 0.0  # 计划充电量
@@ -264,6 +269,9 @@ class EV:
         self.service_serve_option_id = -1
         self.service_marginal_weight = 0.0
         self.low_service_marginal_weight = 0.0
+        self.service_counterfactual_failure_probability = 0.0
+        self.service_success_credit = 0.0
+        self.service_rescue_diagnostics = {}
         self.feasible_mcs_count = 0
         self.feasible_fcs_slot_count = 0
         self.charge_power_kwh = 0.0  # 计划充电量
@@ -360,10 +368,16 @@ class MCS:
         self.total_idle_time_min = 0.0
         # 连续主动 Wait 的环境 step 数；forced Wait 不累计。
         self.consecutive_voluntary_wait_steps = 0
-        # 当前仍在生效的 Low Serve 空间决策。任务结束时暂不清除，避免
-        # 同一 step 自动再匹配时丢失归因；下一次显式 High 决策会覆写。
+        # 当前仍在生效的 High Serve / Low 空间决策。一个 Serve Option
+        # 最多允许一次 MCS-IEV 匹配，避免任务完成的同一 step 自动接取
+        # 第二个订单并继续沿用旧 Option ID。
         self.active_low_decision_id = -1
         self.active_serve_option_id = -1
+        # High option_id 对 Serve/Recharge 均稳定存在；不能再借用仅 Serve
+        # 有效的 active_serve_option_id 做历史失败回写。
+        self.active_high_option_id = -1
+        self.active_high_mode = ""
+        self.active_serve_has_matched = False
         self.active_low_candidate_id = -1
         self.active_low_started_step = -1
 
@@ -499,6 +513,9 @@ class MCS:
         self.consecutive_voluntary_wait_steps = 0
         self.active_low_decision_id = -1
         self.active_serve_option_id = -1
+        self.active_high_option_id = -1
+        self.active_high_mode = ""
+        self.active_serve_has_matched = False
         self.active_low_candidate_id = -1
         self.active_low_started_step = -1
 
