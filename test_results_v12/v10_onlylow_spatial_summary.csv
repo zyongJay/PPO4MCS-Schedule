@@ -1,0 +1,2 @@
+policy_name,scenario_count,seed_min,seed_max,spatial_conflict_rate,spatial_conflict_numerator,spatial_conflict_denominator,weighted_spatial_conflict_rate,spatial_conflict_definition
+v10_onlylow,50,1050,1099,0.1218311111111111,54824,450000,0.12183111111111111,post_step_active_mcs_pair_distance_km_lte_3

@@ -1,0 +1,11 @@
+{
+  "policy": "uniform_random_legal_dispatch_point",
+  "stay_semantics": "fallback_only_when_no_dispatch_point_is_legal",
+  "seed_start": 1050,
+  "num_scenarios": 50,
+  "max_steps": 200,
+  "grid_rows": 4,
+  "grid_columns": 4,
+  "dispatch_point_count": 16,
+  "environment": "centralized_fixed_step_schedule_progress_match_reward"
+}

@@ -1,0 +1,86 @@
+v15：全局异构二元符号图 + 两跳稀疏符号注意力 MAPPO
+
+1. 对照基线
+   - 仿真环境、匹配机制、奖励、Low 候选动作集、Option/GAE/PPO 流程与
+     v14/v10_onlylow 保持一致。
+   - High 层继续使用严格 remain < 40 kWh 的固定 Recharge 阈值，不训练
+     High Actor/Critic。
+
+2. 节点
+   - 沿用 v14 的唯一全局节点编码及原始节点状态：10 MCS、5 FCS、300 EV。
+   - MCS/FCS/EV 分别经过类型专属 MLP。
+   - 只有 quasi/IEV EV 参与建边；成功、失败和离开系统的 EV 保留固定槽位
+     但不参与消息传递。损坏或能量耗尽的 MCS 不参与建边。
+
+3. 3 km 二元符号边
+   - 正边：MCS-EV、FCS-EV。
+   - 负边：MCS-MCS、MCS-FCS、FCS-FCS、EV-EV。
+   - 任意关系只有在节点距离不超过 COMM_RANGE=3 km 时建立，边值只有
+     +1/-1，不使用 v14 的半余弦距离权重。
+   - 与 v14 不同，服务主体竞争边由“3 km 内直接连接”定义，不再由
+     “共享至少一个 EV”推导。
+
+4. 无损紧凑存储
+   - 六类二元边按固定关系顺序和 little-endian bit packing 无损压缩。
+   - 49,455 个可能的无向关系位仅占 6,182 个字节槽位；加节点特征后
+     graph_state_dim=9,962、policy_self_dim=9,963。
+   - 前向时解码为真实稀疏边列表，注意力只在存在的边上计算。
+
+5. 两跳符号注意力
+   - 使用两层同步更新，所有节点在同一层读取同一时刻的旧表示。
+   - 正、负邻居分别执行 Softmax，避免数量较多的 EV-EV 负边淹没正边。
+   - 九个有向异构消息关系分别使用独立 Key/Value 线性变换。
+   - 负边消息保存在独立竞争通道，不对邻居特征机械乘 -1。
+   - 正负消息经过可学习门控融合，每层均包含“自身表示 + 邻居消息”的
+     残差连接、LayerNorm，以及 FFN 残差。
+
+6. Actor/Critic
+   - Actor 仍仅使用当前 MCS 的两跳表示、候选 EV 的两跳表示，以及
+     is_stay/distance_ratio/energy_margin 三个基础候选字段。
+   - 不增加全局 pooling、区域 token、预约、soft occupancy 或动作修正。
+   - Critic 保留原 v10 20 维全局状态，并结合当前 MCS 与候选 EV 表示。
+   - Actor/Critic 使用独立图编码器。
+
+7. 容量控制
+   - graph_hidden_dim=10、attention_heads=2、graph_layers=2。
+   - 默认 hidden_dim=128 时，v15 Low Actor/Critic 参数量约为
+     35,375/38,395，接近 v14 的 37,201/40,881，避免容量明显膨胀。
+
+8. 日志
+   - 记录六类边数量、正负边比例、密度、各类型度数、孤立节点、连通分量
+     和最大分量。
+   - 记录两层、三类节点的正负注意力熵、最大权重、有邻居比例、消息范数
+     与门控均值。
+   - 保留梯度、参数更新、节点表示离散度和全边移除反事实诊断。
+
+9. 入口
+   - 训练：demo/train_v15.py
+   - 测试：demo/test_v15.py
+   - 默认训练目录：training_results_v15
+   - 默认测试目录：test_results_v15
+
+10. 配套消融与奖励变体
+   - v15_nodeonly：保持v15节点特征、网络头、候选动作、奖励和参数形状，
+     但在每次前向前清零全部正负边，禁止跨节点消息传递；用于隔离符号边
+     聚合相对独立节点编码的贡献。训练入口demo/train_v15_nodeonly.py，目录
+     training_results_v15_nodeonly，训练300 episodes。
+   - v15_outcome_reward：保持v15符号图和两跳注意力，仅将Low reward切换
+     为reward_v14.py的outcome-only设计，去除候选优先、吸引/竞争差分和
+     空间等待机会等人工空间塑形；保留实际服务成功/失败、真实MCS利润、
+     移动能耗、安全和非空间等待成本。入口demo/train_v15_outcome_reward.py，
+     目录training_results_v15_outcome_reward，训练1000 episodes。
+   - v15_nodeonly_outcome_reward：在相同outcome-only奖励下关闭全部正负边，
+     作为v15_outcome_reward的严格node-only对照。入口
+     demo/train_v15_nodeonly_outcome_reward.py，目录
+     training_results_v15_nodeonly_outcome_reward，训练1000 episodes。
+
+11. 四版本控制变量
+   - v15 vs v15_nodeonly：只改变是否允许正负边消息传递。
+   - v15_outcome_reward vs v15_nodeonly_outcome_reward：在去除人工空间奖励后，
+     只改变是否允许正负边消息传递。
+   - v15 vs v15_outcome_reward：图结构不变，只改变Low reward。
+   - 两个nodeonly版本之间：节点模型不变，只改变Low reward。
+
+注意：v15 是“全局统一构图 + 3 km 局部两跳聚合”，不同连通分量不会交换
+消息，Actor 也尚未读取全局 pooling。因此它仍用于检验符号关系和注意力
+消息传递本身，不宣称已经实现跨区域全局调度。

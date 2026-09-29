@@ -32,6 +32,7 @@ from config import (
     MCS_FEAT_DIM_self,
     MCS_FEAT_DIM_tgt,
     MCS_HIGH_FEAT_DIM,
+    MCS_RECHARGE_THRESHOLD,
     TOP_K_MCS_CANDIDATES,
     TRACK_DATA_PATH,
 )
@@ -122,6 +123,51 @@ def explained_variance(
     return float((1.0 - residual_var / target_var).item())
 
 
+def select_fixed_threshold_high_actions(
+    mcss: List[MCS],
+    observations: List[Dict],
+    recharge_threshold_kwh: float,
+) -> List[Dict]:
+    """以固定电量阈值替代 High Actor 的 Option 边界决策。
+
+    与 ``test_actor.select_threshold_high_action`` 保持相同的安全语义：
+    Serve 被绝对安全约束屏蔽时无条件 Recharge；只有两种动作都合法时，
+    才按严格的 ``remain < threshold`` 规则选择 Recharge。固定决策没有
+    策略梯度，因此 High 的 log-prob 和 Critic value 都记录为 0。
+    """
+    if len(mcss) != len(observations):
+        raise ValueError('固定 High 的 MCS 与 observation 数量不一致')
+    actions: List[Dict] = []
+    for mcs, observation in zip(mcss, observations):
+        high_mask = np.asarray(
+            observation.get('high_action_mask', []), dtype=bool
+        ).reshape(-1)
+        if high_mask.size < 2:
+            raise ValueError('固定 High 缺少 Serve/Recharge 动作掩码')
+        serve_allowed = bool(high_mask[0])
+        recharge_allowed = bool(high_mask[1])
+        if not serve_allowed and recharge_allowed:
+            high_action = 1
+        elif (
+            serve_allowed
+            and recharge_allowed
+            and float(mcs.remain) < recharge_threshold_kwh
+        ):
+            high_action = 1
+        elif serve_allowed:
+            high_action = 0
+        elif recharge_allowed:
+            high_action = 1
+        else:
+            raise RuntimeError('High 动作掩码中 Serve/Recharge 均不可用')
+        actions.append({
+            'mode': ('Serve', 'Recharge')[high_action],
+            'high_action': high_action,
+            'high_log_prob': 0.0,
+        })
+    return actions
+
+
 def ppo_update(
     agent: MCSMAPPOAgent,
     high_buffer: HighOptionRolloutBuffer,
@@ -135,9 +181,9 @@ def ppo_update(
     max_grad_norm: float,
     train_high: bool = True,
 ) -> Dict[str, float]:
-    high_data = high_buffer.as_tensors(agent.device)
-    high_advantages = normalize_advantages(high_data['advantages'])
-    high_sample_count = high_advantages.shape[0]
+    high_data = None
+    high_advantages = None
+    high_sample_count = len(high_buffer)
     high_losses: List[float] = []
     low_losses: List[float] = []
     high_critic_losses: List[float] = []
@@ -147,12 +193,22 @@ def ppo_update(
     low_approx_kls: List[float] = []
     low_clip_fractions: List[float] = []
     low_actor_grad_norms: List[float] = []
+    low_critic_grad_norms: List[float] = []
+    low_ratio_means: List[float] = []
+    low_ratio_stds: List[float] = []
+    low_ratio_mins: List[float] = []
+    low_ratio_maxs: List[float] = []
 
-    with torch.no_grad():
-        high_ev = explained_variance(
-            high_data['returns'],
-            agent.high_values(high_data['critic_states']),
-        )
+    high_ev = 0.0
+    if train_high:
+        high_data = high_buffer.as_tensors(agent.device)
+        high_advantages = normalize_advantages(high_data['advantages'])
+        high_sample_count = high_advantages.shape[0]
+        with torch.no_grad():
+            high_ev = explained_variance(
+                high_data['returns'],
+                agent.high_values(high_data['critic_states']),
+            )
 
     low_data = None
     low_advantages = None
@@ -166,6 +222,13 @@ def ppo_update(
     low_top1_top2_probability_gap = 0.0
     low_sample_greedy_consistency = 0.0
     low_valid_action_count = 0.0
+    low_value_mean = 0.0
+    low_value_std = 0.0
+    low_preupdate_ratio_mean = 1.0
+    low_preupdate_ratio_std = 0.0
+    low_preupdate_ratio_min = 1.0
+    low_preupdate_ratio_max = 1.0
+    low_preupdate_logprob_max_abs_error = 0.0
     if low_sample_count:
         low_data = low_buffer.as_tensors(agent.device)
         low_advantages = normalize_advantages(low_data['advantages'])
@@ -178,14 +241,18 @@ def ppo_update(
             low_advantage_positive_fraction = float(
                 (raw_low_advantages > 0.0).float().mean().item()
             )
+            diagnostic_low_values = agent.low_values(
+                low_data['global_states'],
+                low_data['low_self_states'],
+                low_data['low_candidates'],
+                low_data['low_masks'],
+            )
             low_ev = explained_variance(
-                low_data['returns'],
-                agent.low_values(
-                    low_data['global_states'],
-                    low_data['low_self_states'],
-                    low_data['low_candidates'],
-                    low_data['low_masks'],
-                ),
+                low_data['returns'], diagnostic_low_values
+            )
+            low_value_mean = float(diagnostic_low_values.mean().item())
+            low_value_std = float(
+                diagnostic_low_values.std(unbiased=False).item()
             )
             low_distribution = agent.low_actor.distribution(
                 low_data['low_self_states'],
@@ -193,6 +260,22 @@ def ppo_update(
                 low_data['low_masks'],
             )
             low_probabilities = low_distribution.probs
+            replay_log_probs = low_distribution.log_prob(
+                low_data['low_actions']
+            )
+            replay_log_ratio = (
+                replay_log_probs - low_data['old_low_log_probs']
+            )
+            replay_ratio = torch.exp(replay_log_ratio)
+            low_preupdate_ratio_mean = float(replay_ratio.mean().item())
+            low_preupdate_ratio_std = float(
+                replay_ratio.std(unbiased=False).item()
+            )
+            low_preupdate_ratio_min = float(replay_ratio.min().item())
+            low_preupdate_ratio_max = float(replay_ratio.max().item())
+            low_preupdate_logprob_max_abs_error = float(
+                replay_log_ratio.abs().max().item()
+            )
             low_policy_entropy = low_distribution.entropy()
             valid_action_counts = low_data['low_masks'].sum(dim=-1)
             entropy_denominator = torch.log(
@@ -232,7 +315,7 @@ def ppo_update(
             )
 
     for _ in range(update_epochs):
-        if train_high:
+        if train_high and high_data is not None and high_advantages is not None:
             permutation = torch.randperm(
                 high_sample_count, device=agent.device
             )
@@ -326,6 +409,12 @@ def ppo_update(
                 ((low_ratio - 1.0).abs() > clip_ratio)
                 .float().mean().item()
             ))
+            low_ratio_means.append(float(low_ratio.mean().item()))
+            low_ratio_stds.append(float(
+                low_ratio.std(unbiased=False).item()
+            ))
+            low_ratio_mins.append(float(low_ratio.min().item()))
+            low_ratio_maxs.append(float(low_ratio.max().item()))
             low_actor_grad_norms.append(float(low_actor_grad_norm.item()))
 
             predictions = agent.low_values(
@@ -339,11 +428,14 @@ def ppo_update(
             )
             agent.low_critic_optimizer.zero_grad()
             low_critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
+            low_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                 agent.low_critic.parameters(), max_grad_norm
             )
             agent.low_critic_optimizer.step()
             low_critic_losses.append(float(low_critic_loss.item()))
+            low_critic_grad_norms.append(
+                float(low_critic_grad_norm.item())
+            )
 
     high_mean = float(np.mean(high_losses)) if high_losses else 0.0
     low_mean = float(np.mean(low_losses)) if low_losses else 0.0
@@ -372,6 +464,15 @@ def ppo_update(
         ),
         'low_sample_greedy_consistency': low_sample_greedy_consistency,
         'low_valid_action_count': low_valid_action_count,
+        'low_value_mean': low_value_mean,
+        'low_value_std': low_value_std,
+        'low_preupdate_ratio_mean': low_preupdate_ratio_mean,
+        'low_preupdate_ratio_std': low_preupdate_ratio_std,
+        'low_preupdate_ratio_min': low_preupdate_ratio_min,
+        'low_preupdate_ratio_max': low_preupdate_ratio_max,
+        'low_preupdate_logprob_max_abs_error': (
+            low_preupdate_logprob_max_abs_error
+        ),
         'low_advantage_mean': low_advantage_mean,
         'low_advantage_std': low_advantage_std,
         'low_advantage_positive_fraction': (
@@ -387,6 +488,22 @@ def ppo_update(
         'low_actor_grad_norm': (
             float(np.mean(low_actor_grad_norms))
             if low_actor_grad_norms else 0.0
+        ),
+        'low_critic_grad_norm': (
+            float(np.mean(low_critic_grad_norms))
+            if low_critic_grad_norms else 0.0
+        ),
+        'low_ppo_ratio_mean': (
+            float(np.mean(low_ratio_means)) if low_ratio_means else 1.0
+        ),
+        'low_ppo_ratio_std': (
+            float(np.mean(low_ratio_stds)) if low_ratio_stds else 0.0
+        ),
+        'low_ppo_ratio_min': (
+            float(np.min(low_ratio_mins)) if low_ratio_mins else 1.0
+        ),
+        'low_ppo_ratio_max': (
+            float(np.max(low_ratio_maxs)) if low_ratio_maxs else 1.0
         ),
     }
 
@@ -664,6 +781,17 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='冻结 High Actor 与 High Critic，只更新 Low Actor/Critic',
     )
+    parser.add_argument(
+        '--fixed-high-threshold',
+        action='store_true',
+        help='以固定电量阈值替代 High Actor；High Actor/Critic 不参与训练',
+    )
+    parser.add_argument(
+        '--fixed-high-recharge-threshold-kwh',
+        type=float,
+        default=float(MCS_RECHARGE_THRESHOLD),
+        help='固定 High 在 Option 边界选择 Recharge 的严格电量阈值',
+    )
     return parser.parse_args()
 
 
@@ -902,7 +1030,8 @@ def collect_episode(
             actor for actor in acting_agents if isinstance(actor, MCS)
         ]
 
-        # High 只在上一个 option 已终止时采样。
+        # High 只在上一个 option 已终止时决策；fixed-high 模式以确定性
+        # 阈值替代 High Actor，且不读取 High Critic 的价值。
         boundary_mcss = [
             mcs for mcs in acting_mcss
             if mcs.id not in high_buffer.open_options
@@ -911,14 +1040,25 @@ def collect_episode(
             boundary_observations = [
                 observation_by_agent[mcs] for mcs in boundary_mcss
             ]
-            boundary_actions = agent.select_high_actions_batch(
-                boundary_observations
-            )
+            if args.fixed_high_threshold:
+                boundary_actions = select_fixed_threshold_high_actions(
+                    boundary_mcss,
+                    boundary_observations,
+                    args.fixed_high_recharge_threshold_kwh,
+                )
+            else:
+                boundary_actions = agent.select_high_actions_batch(
+                    boundary_observations
+                )
             boundary_states = np.stack([
                 critic_input(global_state, observation['high_state'])
                 for observation in boundary_observations
             ])
-            boundary_values = agent.get_high_values_batch(boundary_states)
+            boundary_values = (
+                np.zeros(len(boundary_mcss), dtype=np.float32)
+                if args.fixed_high_threshold
+                else agent.get_high_values_batch(boundary_states)
+            )
             for index, (mcs, observation, action) in enumerate(zip(
                 boundary_mcss, boundary_observations, boundary_actions
             )):
@@ -1417,14 +1557,19 @@ def collect_episode(
             }
             close_values: Dict[int, float] = {}
             if nonterminal_close_mcss:
-                values = agent.get_high_values_batch(np.stack([
-                    close_states[mcs.id]
-                    for mcs in nonterminal_close_mcss
-                ]))
-                close_values = {
-                    mcs.id: float(values[index])
-                    for index, mcs in enumerate(nonterminal_close_mcss)
-                }
+                if args.fixed_high_threshold:
+                    close_values = {
+                        mcs.id: 0.0 for mcs in nonterminal_close_mcss
+                    }
+                else:
+                    values = agent.get_high_values_batch(np.stack([
+                        close_states[mcs.id]
+                        for mcs in nonterminal_close_mcss
+                    ]))
+                    close_values = {
+                        mcs.id: float(values[index])
+                        for index, mcs in enumerate(nonterminal_close_mcss)
+                    }
             high_buffer.close_options(
                 decision_ready_ids=close_reasons,
                 next_critic_states=close_states,
@@ -1931,8 +2076,16 @@ def main() -> None:
     args = parse_args()
     if args.resume is not None and args.high_checkpoint is not None:
         raise ValueError('--resume 与 --high-checkpoint 不能同时使用')
-    if args.freeze_high and args.high_checkpoint is None:
+    if args.fixed_high_threshold:
+        args.freeze_high = True
+    if (
+        args.freeze_high
+        and args.high_checkpoint is None
+        and not args.fixed_high_threshold
+    ):
         raise ValueError('--freeze-high 必须配合 --high-checkpoint')
+    if args.fixed_high_recharge_threshold_kwh <= 0.0:
+        raise ValueError('fixed-high-recharge-threshold-kwh must be positive')
     if args.episodes <= 0 or args.max_steps <= 0:
         raise ValueError('episodes and max-steps must be positive')
     if (
@@ -2055,6 +2208,14 @@ def main() -> None:
         'checkpoint_selection_window': CHECKPOINT_SELECTION_WINDOW,
         'checkpoint_success_tolerance': CHECKPOINT_SUCCESS_TOLERANCE,
         'high_option_boundary_version': 'serve_complete_recharge_complete',
+        'high_policy': (
+            'fixed_threshold' if args.fixed_high_threshold else 'learned_ppo'
+        ),
+        'fixed_high_recharge_threshold_kwh': (
+            float(args.fixed_high_recharge_threshold_kwh)
+            if args.fixed_high_threshold else None
+        ),
+        'high_actor_critic_trained': bool(not args.freeze_high),
         'low_gae_scope': 'within_high_serve_option',
         'serve_quasi_topk_capacity': max(
             int(TOP_K_MCS_CANDIDATES) - 1, 0

@@ -1,0 +1,43 @@
+device=cuda cuda_name=NVIDIA GeForce RTX 4090 episodes_per_update=8 minibatch=1024
+update=1 episodes=1-8 samples=11791 avg_reward=0.0371 charge_success=0.7904 mcs_profit=401.97 checkpoint40_success=0.7904 best=False actor_loss=-0.0004 critic_loss=0.0390 cuda_peak_mb=2124.8
+update=2 episodes=9-16 samples=11720 avg_reward=0.0423 charge_success=0.7743 mcs_profit=414.17 checkpoint40_success=0.7824 best=False actor_loss=-0.0011 critic_loss=0.0449 cuda_peak_mb=2096.6
+update=3 episodes=17-24 samples=11666 avg_reward=0.0409 charge_success=0.7760 mcs_profit=411.84 checkpoint40_success=0.7802 best=False actor_loss=-0.0014 critic_loss=0.0426 cuda_peak_mb=2088.1
+update=4 episodes=25-32 samples=11461 avg_reward=0.0435 charge_success=0.7782 mcs_profit=419.17 checkpoint40_success=0.7797 best=False actor_loss=0.0020 critic_loss=0.0453 cuda_peak_mb=2041.8
+update=5 episodes=33-40 samples=11570 avg_reward=0.0450 charge_success=0.7354 mcs_profit=414.21 checkpoint40_success=0.7708 best=True actor_loss=0.0004 critic_loss=0.0483 cuda_peak_mb=2054.2
+update=6 episodes=41-48 samples=11833 avg_reward=0.0392 charge_success=0.7956 mcs_profit=402.14 checkpoint40_success=0.7719 best=True actor_loss=-0.0008 critic_loss=0.0411 cuda_peak_mb=2126.8
+update=7 episodes=49-56 samples=11980 avg_reward=0.0405 charge_success=0.7762 mcs_profit=402.59 checkpoint40_success=0.7723 best=False actor_loss=-0.0030 critic_loss=0.0414 cuda_peak_mb=2139.7
+update=8 episodes=57-64 samples=11713 avg_reward=0.0383 charge_success=0.7986 mcs_profit=407.72 checkpoint40_success=0.7768 best=True actor_loss=-0.0014 critic_loss=0.0415 cuda_peak_mb=2107.7
+update=9 episodes=65-72 samples=11841 avg_reward=0.0380 charge_success=0.7804 mcs_profit=401.59 checkpoint40_success=0.7772 best=False actor_loss=-0.0020 critic_loss=0.0423 cuda_peak_mb=2134.8
+update=10 episodes=73-80 samples=11484 avg_reward=0.0437 charge_success=0.7505 mcs_profit=415.47 checkpoint40_success=0.7803 best=True actor_loss=-0.0013 critic_loss=0.0468 cuda_peak_mb=2060.7
+update=11 episodes=81-88 samples=11716 avg_reward=0.0384 charge_success=0.7762 mcs_profit=409.82 checkpoint40_success=0.7764 best=False actor_loss=-0.0016 critic_loss=0.0367 cuda_peak_mb=2099.0
+update=12 episodes=89-96 samples=11851 avg_reward=0.0441 charge_success=0.7675 mcs_profit=403.82 checkpoint40_success=0.7746 best=False actor_loss=-0.0018 critic_loss=0.0410 cuda_peak_mb=2114.0
+update=13 episodes=97-104 samples=11413 avg_reward=0.0527 charge_success=0.7778 mcs_profit=429.52 checkpoint40_success=0.7705 best=False actor_loss=-0.0007 critic_loss=0.0437 cuda_peak_mb=2020.0
+update=14 episodes=105-112 samples=11694 avg_reward=0.0393 charge_success=0.7697 mcs_profit=410.36 checkpoint40_success=0.7683 best=False actor_loss=-0.0005 critic_loss=0.0434 cuda_peak_mb=2103.8
+update=15 episodes=113-120 samples=11544 avg_reward=0.0456 charge_success=0.7718 mcs_profit=417.98 checkpoint40_success=0.7726 best=False actor_loss=-0.0029 critic_loss=0.0452 cuda_peak_mb=2062.9
+update=16 episodes=121-128 samples=11723 avg_reward=0.0388 charge_success=0.7833 mcs_profit=406.93 checkpoint40_success=0.7740 best=False actor_loss=-0.0025 critic_loss=0.0389 cuda_peak_mb=2116.8
+update=17 episodes=129-136 samples=11539 avg_reward=0.0482 charge_success=0.7829 mcs_profit=417.65 checkpoint40_success=0.7771 best=False actor_loss=0.0004 critic_loss=0.0460 cuda_peak_mb=2044.1
+update=18 episodes=137-144 samples=11740 avg_reward=0.0443 charge_success=0.7898 mcs_profit=410.14 checkpoint40_success=0.7795 best=True actor_loss=-0.0014 critic_loss=0.0398 cuda_peak_mb=2105.2
+update=19 episodes=145-152 samples=11630 avg_reward=0.0421 charge_success=0.7764 mcs_profit=415.47 checkpoint40_success=0.7808 best=True actor_loss=-0.0018 critic_loss=0.0405 cuda_peak_mb=2066.5
+update=20 episodes=153-160 samples=11909 avg_reward=0.0373 charge_success=0.7987 mcs_profit=400.61 checkpoint40_success=0.7862 best=True actor_loss=-0.0013 critic_loss=0.0372 cuda_peak_mb=2140.8
+update=21 episodes=161-168 samples=11678 avg_reward=0.0420 charge_success=0.7949 mcs_profit=414.40 checkpoint40_success=0.7885 best=True actor_loss=-0.0038 critic_loss=0.0455 cuda_peak_mb=2087.0
+update=22 episodes=169-176 samples=11485 avg_reward=0.0487 charge_success=0.7950 mcs_profit=426.40 checkpoint40_success=0.7910 best=True actor_loss=-0.0014 critic_loss=0.0443 cuda_peak_mb=2036.4
+update=23 episodes=177-184 samples=11689 avg_reward=0.0425 charge_success=0.7899 mcs_profit=413.48 checkpoint40_success=0.7910 best=True actor_loss=-0.0044 critic_loss=0.0411 cuda_peak_mb=2079.3
+update=24 episodes=185-192 samples=11516 avg_reward=0.0460 charge_success=0.7713 mcs_profit=420.93 checkpoint40_success=0.7900 best=True actor_loss=-0.0051 critic_loss=0.0403 cuda_peak_mb=2051.7
+update=25 episodes=193-200 samples=11538 avg_reward=0.0489 charge_success=0.7769 mcs_profit=417.90 checkpoint40_success=0.7856 best=False actor_loss=-0.0037 critic_loss=0.0385 cuda_peak_mb=2053.1
+update=26 episodes=201-208 samples=11765 avg_reward=0.0433 charge_success=0.7599 mcs_profit=410.95 checkpoint40_success=0.7786 best=False actor_loss=-0.0014 critic_loss=0.0398 cuda_peak_mb=2101.7
+update=27 episodes=209-216 samples=11632 avg_reward=0.0440 charge_success=0.8283 mcs_profit=414.05 checkpoint40_success=0.7853 best=False actor_loss=-0.0011 critic_loss=0.0356 cuda_peak_mb=2087.0
+update=28 episodes=217-224 samples=11529 avg_reward=0.0476 charge_success=0.7808 mcs_profit=421.39 checkpoint40_success=0.7834 best=False actor_loss=0.0002 critic_loss=0.0396 cuda_peak_mb=2042.9
+update=29 episodes=225-232 samples=11518 avg_reward=0.0431 charge_success=0.7703 mcs_profit=413.68 checkpoint40_success=0.7832 best=False actor_loss=-0.0003 critic_loss=0.0399 cuda_peak_mb=2074.9
+update=30 episodes=233-240 samples=11729 avg_reward=0.0433 charge_success=0.7608 mcs_profit=412.03 checkpoint40_success=0.7800 best=False actor_loss=-0.0017 critic_loss=0.0397 cuda_peak_mb=2104.1
+update=31 episodes=241-248 samples=11387 avg_reward=0.0518 charge_success=0.7731 mcs_profit=422.91 checkpoint40_success=0.7826 best=False actor_loss=-0.0007 critic_loss=0.0434 cuda_peak_mb=2036.1
+update=32 episodes=249-256 samples=11446 avg_reward=0.0485 charge_success=0.7959 mcs_profit=428.18 checkpoint40_success=0.7762 best=False actor_loss=-0.0115 critic_loss=0.0393 cuda_peak_mb=2036.1
+update=33 episodes=257-264 samples=11667 avg_reward=0.0426 charge_success=0.7671 mcs_profit=419.40 checkpoint40_success=0.7734 best=False actor_loss=-0.0032 critic_loss=0.0376 cuda_peak_mb=2087.4
+update=34 episodes=265-272 samples=11704 avg_reward=0.0425 charge_success=0.7914 mcs_profit=414.51 checkpoint40_success=0.7776 best=False actor_loss=-0.0016 critic_loss=0.0372 cuda_peak_mb=2085.6
+update=35 episodes=273-280 samples=11561 avg_reward=0.0442 charge_success=0.7930 mcs_profit=419.09 checkpoint40_success=0.7841 best=False actor_loss=-0.0033 critic_loss=0.0361 cuda_peak_mb=2058.3
+update=36 episodes=281-288 samples=11790 avg_reward=0.0439 charge_success=0.7570 mcs_profit=410.47 checkpoint40_success=0.7809 best=False actor_loss=-0.0003 critic_loss=0.0416 cuda_peak_mb=2096.9
+update=37 episodes=289-296 samples=11988 avg_reward=0.0386 charge_success=0.7692 mcs_profit=401.72 checkpoint40_success=0.7755 best=False actor_loss=-0.0020 critic_loss=0.0381 cuda_peak_mb=2148.3
+update=38 episodes=297-300 samples=5975 avg_reward=0.0422 charge_success=0.7896 mcs_profit=400.26 checkpoint40_success=0.7762 best=False actor_loss=-0.0010 critic_loss=0.0325 cuda_peak_mb=1083.2
+training log: /srv/AI_projects/zyongjay/PPO_v10/training_results_v14_nodeonly/training_log.csv
+high option rollout: /srv/AI_projects/zyongjay/PPO_v10/training_results_v14_nodeonly/high_option_rollout.csv
+low option rollout: /srv/AI_projects/zyongjay/PPO_v10/training_results_v14_nodeonly/low_option_rollout.csv
+convergence curves: /srv/AI_projects/zyongjay/PPO_v10/training_results_v14_nodeonly/convergence_curves.png

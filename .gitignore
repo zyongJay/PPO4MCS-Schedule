@@ -1,10 +1,20 @@
 # Python runtime artifacts
 __pycache__/
 *.py[cod]
+.venv/
 
 # Jupyter runtime artifacts
 .ipynb_checkpoints/
 
 # IDE-local state
 .idea/csv-editor.xml
+
+# Local experiment artifacts: keep source/configuration and compact fixed-scenario
+# summaries under version control, but not reconstructible environments, model
+# binaries, or per-option raw rollouts (some individual files exceed GitHub's
+# 100 MB file limit).
+training_results*/**/*.pt
+training_results*/**/*rollout*.csv
+visual_results*/
+*.bak_*
 

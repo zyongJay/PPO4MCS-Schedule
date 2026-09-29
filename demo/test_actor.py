@@ -60,6 +60,9 @@ DEFAULT_CHECKPOINT = (
 )
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / 'test_actor_results'
 DEFAULT_ACTOR_SEEDS = tuple(range(1001, 1051))
+DEFAULT_ONLYLOW_CHECKPOINT = (
+    PROJECT_DIR / 'training_results_v10_onlylow' / 'best_model.pt'
+)
 
 # config.py 中的轨迹路径以 demo 目录为基准。转为绝对路径，避免启动目录影响。
 world_module.TRACK_DATA_PATH = str((SCRIPT_DIR / TRACK_DATA_PATH).resolve())
@@ -120,6 +123,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_CHECKPOINT,
         help='默认使用 v10 按充电率选出的 best_model.pt',
+    )
+    parser.add_argument(
+        '--onlylow-checkpoint',
+        type=Path,
+        default=DEFAULT_ONLYLOW_CHECKPOINT,
+        help='v10_onlylow 的 Low Actor checkpoint（High 使用固定阈值）',
+    )
+    parser.add_argument(
+        '--three-policy',
+        action='store_true',
+        help='仅比较 v10、v10_onlylow（阈值 High）和完整 Random',
     )
     parser.add_argument(
         '--seeds',
@@ -780,7 +794,10 @@ COMPARISON_PAIRS = (
 )
 
 
-def build_paired_comparison(scenarios: pd.DataFrame) -> pd.DataFrame:
+def build_paired_comparison(
+    scenarios: pd.DataFrame,
+    comparison_pairs: Sequence[tuple[str, str]] = COMPARISON_PAIRS,
+) -> pd.DataFrame:
     """对 A/B/C/D 两两配对，避免场景难度差异掩盖策略差异。"""
     rows = []
     pivot_tables = {
@@ -789,7 +806,7 @@ def build_paired_comparison(scenarios: pd.DataFrame) -> pd.DataFrame:
         )
         for metric in METRIC_DIRECTIONS
     }
-    for left_policy, right_policy in COMPARISON_PAIRS:
+    for left_policy, right_policy in comparison_pairs:
         for metric, direction in METRIC_DIRECTIONS.items():
             pivot = pivot_tables[metric]
             if left_policy not in pivot or right_policy not in pivot:
@@ -862,7 +879,7 @@ def print_comparison(comparison: pd.DataFrame) -> None:
         'high_wait_ratio',
         'avg_low_selected_candidate_rank',
     ]
-    print('\n四组策略两两配对汇总（delta = left - right）')
+    print('\n策略两两配对汇总（delta = left - right）')
     for comparison_name, group in comparison.groupby(
         'comparison', sort=False
     ):
@@ -894,12 +911,23 @@ def main() -> None:
     checkpoint_path = args.checkpoint.expanduser().resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f'checkpoint 不存在: {checkpoint_path}')
+    onlylow_checkpoint_path = args.onlylow_checkpoint.expanduser().resolve()
+    if args.three_policy and not onlylow_checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f'v10_onlylow checkpoint 不存在: {onlylow_checkpoint_path}'
+        )
 
     device = resolve_device(args.device)
     torch.set_num_threads(args.torch_threads)
     agent, checkpoint_metadata = load_rl_agent(
         checkpoint_path, args.hidden_dim, device
     )
+    onlylow_agent = None
+    onlylow_checkpoint_metadata: Dict = {}
+    if args.three_policy:
+        onlylow_agent, onlylow_checkpoint_metadata = load_rl_agent(
+            onlylow_checkpoint_path, args.hidden_dim, device
+        )
     max_steps = min(args.max_steps, MAX_STEPS_PER_EPISODE)
 
     print(
@@ -907,15 +935,48 @@ def main() -> None:
         f'paired_scenarios={len(args.seeds)} max_steps={max_steps}'
     )
     scenario_rows = []
-    experiments = (
-        (EXPERIMENT_A, 'learned'),
-        (EXPERIMENT_B, 'random_low'),
-        (EXPERIMENT_C, 'full_random'),
-        (EXPERIMENT_D, 'threshold_high_learned_low'),
-    )
-    # 种子在外层循环，使每个场景的 A/B/C/D 结果紧邻输出。
+    if args.three_policy:
+        if onlylow_agent is None:
+            raise RuntimeError('v10_onlylow agent 未正确加载')
+        experiments = (
+            ('v10', 'learned', checkpoint_path, checkpoint_metadata, agent),
+            (
+                'v10_onlylow',
+                'threshold_high_learned_low',
+                onlylow_checkpoint_path,
+                onlylow_checkpoint_metadata,
+                onlylow_agent,
+            ),
+            ('Random', 'full_random', checkpoint_path, checkpoint_metadata, agent),
+        )
+        comparison_pairs = (
+            ('v10', 'v10_onlylow'),
+            ('v10', 'Random'),
+            ('v10_onlylow', 'Random'),
+        )
+    else:
+        experiments = (
+            (EXPERIMENT_A, 'learned', checkpoint_path, checkpoint_metadata, agent),
+            (EXPERIMENT_B, 'random_low', checkpoint_path, checkpoint_metadata, agent),
+            (EXPERIMENT_C, 'full_random', checkpoint_path, checkpoint_metadata, agent),
+            (
+                EXPERIMENT_D,
+                'threshold_high_learned_low',
+                checkpoint_path,
+                checkpoint_metadata,
+                agent,
+            ),
+        )
+        comparison_pairs = COMPARISON_PAIRS
+    # 种子在外层循环，使同一固定场景的策略结果相邻输出。
     for seed in args.seeds:
-        for experiment_name, policy_mode in experiments:
+        for (
+            experiment_name,
+            policy_mode,
+            experiment_checkpoint_path,
+            experiment_checkpoint_metadata,
+            experiment_agent,
+        ) in experiments:
             random_low_seed = (
                 seed if policy_mode == 'full_random'
                 else seed + args.random_low_seed_offset
@@ -926,9 +987,9 @@ def main() -> None:
                 scenario_seed=seed,
                 random_low_seed=random_low_seed,
                 max_steps=max_steps,
-                checkpoint_path=checkpoint_path,
-                checkpoint_metadata=checkpoint_metadata,
-                agent=agent,
+                checkpoint_path=experiment_checkpoint_path,
+                checkpoint_metadata=experiment_checkpoint_metadata,
+                agent=experiment_agent,
             )
             scenario_rows.append(row)
             print(
@@ -975,7 +1036,9 @@ def main() -> None:
         )
 
     summary_table = build_summary(scenario_table)
-    comparison_table = build_paired_comparison(scenario_table)
+    comparison_table = build_paired_comparison(
+        scenario_table, comparison_pairs
+    )
     print_comparison(comparison_table)
 
     if not args.no_save:
@@ -1038,12 +1101,35 @@ def main() -> None:
             ),
             'paired_delta_definition': 'left_policy - right_policy',
         }
+        if args.three_policy:
+            config.update({
+                'evaluation_mode': 'v10_v10_onlylow_random',
+                'checkpoints': {
+                    'v10': str(checkpoint_path),
+                    'v10_onlylow': str(onlylow_checkpoint_path),
+                },
+                'checkpoint_metadata_by_policy': {
+                    'v10': checkpoint_metadata,
+                    'v10_onlylow': onlylow_checkpoint_metadata,
+                },
+                'policies': {
+                    'v10': 'v10 checkpoint High/Low Actor 均使用确定性贪心',
+                    'v10_onlylow': (
+                        'v10_onlylow checkpoint Low Actor 使用确定性贪心；'
+                        'High 在 Option 边界按严格 remain < 40 kWh 固定阈值决策'
+                    ),
+                    'Random': (
+                        '复用 test.py RandomDecisionPolicy 与其物理安全过滤'
+                    ),
+                },
+                'comparison_pairs': [list(pair) for pair in comparison_pairs],
+            })
         config_path.write_text(
             json.dumps(config, ensure_ascii=False, indent=2, default=str),
             encoding='utf-8',
         )
         print(f'\n逐场景结果: {scenario_path}')
-        print(f'四组汇总结果: {summary_path}')
+        print(f'策略汇总结果: {summary_path}')
         print(f'两两配对差异结果: {comparison_path}')
         print(f'评估配置: {config_path}')
 
